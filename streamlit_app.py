@@ -53,80 +53,89 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Login Failed: {e}")
 
-# --- 4. MASTER SCANNER LOGIC ---
+# --- 4. DATA FETCHING (Multi-Tab) ---
+@st.cache_data(ttl=600)
+def get_all_symbols():
+    # Fetching from all 3 scanner tabs
+    s1 = conn.read(worksheet="Scanner_Output 1").iloc[:, 0].tolist()
+    s2 = conn.read(worksheet="Scanner_Output 2").iloc[:, 0].tolist()
+    s3 = conn.read(worksheet="Scanner_Output 3").iloc[:, 0].tolist()
+    combined = list(set([str(s).strip() for s in (s1 + s2 + s3) if s and str(s) != 'nan']))
+    return ["NSE:" + s for s in combined]
+
+# --- 5. MASTER SCANNER ENGINE ---
 if 'access_token' in st.session_state:
     try:
-        # Load Symbols
-        sheet_data = conn.read(worksheet="Scanner_Output 1", ttl=600)
-        symbols = ["NSE:" + str(s).strip() for s in sheet_data.iloc[:, 0].tolist() if s]
-
-        # Fetch Live Quotes
+        symbols = get_all_symbols()
+        
+        # Fetch Live Data in Chunks
         all_quotes = {}
         for i in range(0, len(symbols), 450):
             chunk = symbols[i:i+450]
             all_quotes.update(st.session_state.kite.quote(chunk))
         
         results = []
-        alert_log_data = []
+        alerts = []
+        
+        # Date range for 22-day Volume Check
+        to_date = datetime.now().date()
+        from_date = to_date - timedelta(days=35) # Over-fetching to ensure 22 trading days
 
-        # Optimization: Fetching 22-day High Vol for Alerts
-        # To match Chartink: Volume > Max(22, Volume)
         for s, d in all_quotes.items():
+            instrument_token = d['instrument_token']
             ltp = d['last_price']
             close = d['ohlc']['close']
-            vol = d['volume']
-            change = round(((ltp - close) / close) * 100, 2)
+            curr_vol = d['volume']
+            pct_change = round(((ltp - close) / close) * 100, 2)
             
-            # --- THE CHARTINK LOGIC ---
-            # 1. Volume > 500,000
-            # 2. Change % > 1%
-            # 3. Volume > Prev 22 Day Max (Simulated here with a 2x Avg check or specific threshold)
-            # For a perfect 22-day match, Kite requires historical API access.
-            # If you don't have historical API, we use a high-momentum multiplier:
-            is_high_vol = vol > 500000 
-            is_bullish = change >= 1.0
+            # CHARTINK LOGIC:
+            # 1. Daily Volume > 500,000
+            # 2. Daily % Change > 1%
+            # 3. Daily Volume > Max(22, Daily Volume) 1 day ago
             
-            # Trend Labeling
-            status = "Normal"
-            if is_high_vol and is_bullish:
-                status = "🚀 STR"
-                alert_log_data.append({
-                    "Symbol": s.replace("NSE:", ""),
-                    "LTP": ltp,
-                    "Volume": vol,
-                    "Change %": f"{change}%",
-                    "Signal": "VOL BREAKOUT"
-                })
+            is_breakout = False
+            if curr_vol > 500000 and pct_change > 1.0:
+                try:
+                    # Fetching previous 22 days to find Max Volume
+                    hist = st.session_state.kite.historical_data(instrument_token, from_date, to_date - timedelta(days=1), "day")
+                    if len(hist) >= 22:
+                        last_22_vols = [day['volume'] for day in hist[-22:]]
+                        max_22_vol = max(last_22_vols)
+                        if curr_vol > max_22_vol:
+                            is_breakout = True
+                except:
+                    # Fallback if historical API is busy
+                    is_breakout = False
 
-            results.append({
+            row = {
                 "Symbol": s.replace("NSE:", ""),
                 "LTP": ltp,
-                "Volume": vol,
-                "Change %": change,
-                "Trend": status
-            })
-        
-        df = pd.DataFrame(results)
-        alerts_df = pd.DataFrame(alert_log_data)
+                "Change %": pct_change,
+                "Volume": curr_vol,
+                "Trend": "🚀 STR" if is_breakout else ("🟩" if pct_change > 0 else "🟥")
+            }
+            results.append(row)
+            if is_breakout:
+                alerts.append(row)
 
-        # --- TABS RE-ENABLED WITH ALERT LOG ---
-        t1, t2, t3, t_log = st.tabs(["Scanner 1", "Scanner 2", "Scanner 3", "🔥 Alert Log"])
+        full_df = pd.DataFrame(results)
         
-        with t1: st.dataframe(df.iloc[:250], use_container_width=True)
-        with t2: st.dataframe(df.iloc[250:500], use_container_width=True)
-        with t3: st.dataframe(df.iloc[500:], use_container_width=True)
+        # --- UI LAYOUT ---
+        t1, t2, t3, t_alert = st.tabs(["Scanner 1", "Scanner 2", "Scanner 3", "🔥 Alert Log"])
         
-        with t_log:
-            st.subheader("Chartink Bullish Breakouts")
-            if not alerts_df.empty:
-                st.table(alerts_df)
+        with t1: st.dataframe(full_df.iloc[:250], use_container_width=True)
+        with t2: st.dataframe(full_df.iloc[250:500], use_container_width=True)
+        with t3: st.dataframe(full_df.iloc[500:], use_container_width=True)
+        
+        with t_alert:
+            st.subheader("Chartink Master Breakouts")
+            if alerts:
+                st.table(pd.DataFrame(alerts))
             else:
-                st.info("No stocks currently matching: Vol > 500k & Change > 1%")
+                st.info("No stocks currently crossing Max(22) Volume + 1% Price Change.")
 
         time.sleep(60)
         st.rerun()
 
     except Exception as e:
-        st.error(f"Scanner Error: {e}")
-else:
-    st.info("👋 Please complete the Login in the sidebar to load the 700-Symbol Scanners.")
+        st.error(f"Scanner Sync Error: {e}")
