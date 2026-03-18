@@ -28,7 +28,7 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
         st.session_state.access_token = saved_token
         st.session_state.kite.set_access_token(saved_token)
 
-# --- 3. LOGIN INTERFACE ---
+# --- 3. LOGIN INTERFACE (SIDEBAR) ---
 with st.sidebar:
     st.header("🔑 Session Manager")
     if 'access_token' in st.session_state:
@@ -53,38 +53,27 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Login Failed: {e}")
 
-# --- 4. DATA FETCHING (Multi-Tab) ---
+# --- 4. DATA FETCHING FUNCTION ---
 @st.cache_data(ttl=600)
 def get_all_symbols():
-    # Fetching from all 3 scanner tabs
-    s1 = conn.read(worksheet="Scanner_Output 1").iloc[:, 0].tolist()
-    s2 = conn.read(worksheet="Scanner_Output 2").iloc[:, 0].tolist()
-    s3 = conn.read(worksheet="Scanner_Output 3").iloc[:, 0].tolist()
-    combined = list(set([str(s).strip() for s in (s1 + s2 + s3) if s and str(s) != 'nan']))
-    return ["NSE:" + s for s in combined]
-
-# Create a filter in the sidebar
-st.sidebar.header("🔍 Filter Symbols")
-
-# Get unique symbols from your data
-available_symbols = df['Symbol'].unique().tolist()
-selected_symbols = st.sidebar.multiselect("Select Specific Stocks:", available_symbols)
-
-# Apply Filter logic
-if selected_symbols:
-    filtered_df = df[df['Symbol'].isin(selected_symbols)]
-else:
-    filtered_df = df  # Show everything if nothing is selected
-
-# Display the filtered data instead of the original 'df'
-st.dataframe(filtered_df, use_container_width=True)
+    try:
+        s1 = conn.read(worksheet="Scanner_Output 1").iloc[:, 0].tolist()
+        s2 = conn.read(worksheet="Scanner_Output 2").iloc[:, 0].tolist()
+        s3 = conn.read(worksheet="Scanner_Output 3").iloc[:, 0].tolist()
+        combined = list(set([str(s).strip() for s in (s1 + s2 + s3) if s and str(s) != 'nan']))
+        return ["NSE:" + s for s in combined]
+    except:
+        return []
 
 # --- 5. MASTER SCANNER ENGINE ---
 if 'access_token' in st.session_state:
     try:
         symbols = get_all_symbols()
+        if not symbols:
+            st.warning("No symbols found in Google Sheets.")
+            st.stop()
         
-        # Fetch Live Data in Chunks
+        # Fetch Live Data
         all_quotes = {}
         for i in range(0, len(symbols), 450):
             chunk = symbols[i:i+450]
@@ -93,34 +82,25 @@ if 'access_token' in st.session_state:
         results = []
         alerts = []
         
-        # Date range for 22-day Volume Check
         to_date = datetime.now().date()
-        from_date = to_date - timedelta(days=35) # Over-fetching to ensure 22 trading days
+        from_date = to_date - timedelta(days=35)
 
         for s, d in all_quotes.items():
-            instrument_token = d['instrument_token']
             ltp = d['last_price']
             close = d['ohlc']['close']
             curr_vol = d['volume']
             pct_change = round(((ltp - close) / close) * 100, 2)
             
-            # CHARTINK LOGIC:
-            # 1. Daily Volume > 500,000
-            # 2. Daily % Change > 1%
-            # 3. Daily Volume > Max(22, Daily Volume) 1 day ago
-            
+            # --- CHARTINK LOGIC ---
             is_breakout = False
             if curr_vol > 500000 and pct_change > 1.0:
                 try:
-                    # Fetching previous 22 days to find Max Volume
-                    hist = st.session_state.kite.historical_data(instrument_token, from_date, to_date - timedelta(days=1), "day")
+                    hist = st.session_state.kite.historical_data(d['instrument_token'], from_date, to_date - timedelta(days=1), "day")
                     if len(hist) >= 22:
-                        last_22_vols = [day['volume'] for day in hist[-22:]]
-                        max_22_vol = max(last_22_vols)
+                        max_22_vol = max([day['volume'] for day in hist[-22:]])
                         if curr_vol > max_22_vol:
                             is_breakout = True
                 except:
-                    # Fallback if historical API is busy
                     is_breakout = False
 
             row = {
@@ -134,14 +114,27 @@ if 'access_token' in st.session_state:
             if is_breakout:
                 alerts.append(row)
 
+        # CREATE THE DATAFRAME FIRST
         full_df = pd.DataFrame(results)
         
-        # --- UI LAYOUT ---
+        # --- 6. FILTER LOGIC (Now correctly placed AFTER full_df is created) ---
+        st.sidebar.divider()
+        st.sidebar.header("🔍 Filter Symbols")
+        available_symbols = sorted(full_df['Symbol'].unique().tolist())
+        selected_symbols = st.sidebar.multiselect("Select Specific Stocks:", available_symbols)
+
+        # Apply Filter to display_df
+        if selected_symbols:
+            display_df = full_df[full_df['Symbol'].isin(selected_symbols)]
+        else:
+            display_df = full_df
+
+        # --- 7. UI LAYOUT ---
         t1, t2, t3, t_alert = st.tabs(["Scanner 1", "Scanner 2", "Scanner 3", "🔥 Alert Log"])
         
-        with t1: st.dataframe(full_df.iloc[:250], use_container_width=True)
-        with t2: st.dataframe(full_df.iloc[250:500], use_container_width=True)
-        with t3: st.dataframe(full_df.iloc[500:], use_container_width=True)
+        with t1: st.dataframe(display_df.iloc[:250], use_container_width=True)
+        with t2: st.dataframe(display_df.iloc[250:500], use_container_width=True)
+        with t3: st.dataframe(display_df.iloc[500:], use_container_width=True)
         
         with t_alert:
             st.subheader("Chartink Master Breakouts")
@@ -150,8 +143,11 @@ if 'access_token' in st.session_state:
             else:
                 st.info("No stocks currently crossing Max(22) Volume + 1% Price Change.")
 
+        # Auto-refresh
         time.sleep(60)
         st.rerun()
 
     except Exception as e:
         st.error(f"Scanner Sync Error: {e}")
+else:
+    st.info("👋 Please complete the Login in the sidebar to load the 700-Symbol Scanners.")
