@@ -63,6 +63,22 @@ def get_all_symbols():
     combined = list(set([str(s).strip() for s in (s1 + s2 + s3) if s and str(s) != 'nan']))
     return ["NSE:" + s for s in combined]
 
+# Create a filter in the sidebar
+st.sidebar.header("🔍 Filter Symbols")
+
+# Get unique symbols from your data
+available_symbols = df['Symbol'].unique().tolist()
+selected_symbols = st.sidebar.multiselect("Select Specific Stocks:", available_symbols)
+
+# Apply Filter logic
+if selected_symbols:
+    filtered_df = df[df['Symbol'].isin(selected_symbols)]
+else:
+    filtered_df = df  # Show everything if nothing is selected
+
+# Display the filtered data instead of the original 'df'
+st.dataframe(filtered_df, use_container_width=True)
+
 # --- 5. MASTER SCANNER ENGINE ---
 if 'access_token' in st.session_state:
     try:
