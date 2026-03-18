@@ -3,139 +3,106 @@ import pandas as pd
 from kiteconnect import KiteConnect
 from streamlit_gsheets import GSheetsConnection
 import time
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 
-# --- 1. CONFIGURATION & SECRETS ---
+# --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
+
+# File to store session so it survives refreshes
+TOKEN_FILE = "access_token.txt"
 
 try:
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
-    # Initialize Google Sheets Connection for Alert Logging
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error(f"❌ Setup Error: Please check your Streamlit Secrets. {e}")
+    st.error(f"Setup Error: {e}")
     st.stop()
 
-# --- 2. AUTHENTICATION & PERSISTENCE ---
+# --- 2. SESSION PERSISTENCE ENGINE ---
 if 'kite' not in st.session_state:
     st.session_state.kite = KiteConnect(api_key=API_KEY)
 
-def is_session_active():
-    """Checks if a valid access token exists and hasn't passed the 6 AM daily reset."""
-    if 'access_token' in st.session_state:
-        now = datetime.now()
-        # Kite tokens reset around 6:00 AM IST
-        reset_time = now.replace(hour=6, minute=0, second=0, microsecond=0)
-        if now < reset_time:
-             return True # Still valid from yesterday's login
-        elif 'login_time' in st.session_state and st.session_state.login_time > reset_time:
-             return True # Logged in today after reset
-    return False
+# Try to reload token from file if session state is empty
+if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
+    with open(TOKEN_FILE, "r") as f:
+        saved_token = f.read().strip()
+        st.session_state.access_token = saved_token
+        st.session_state.kite.set_access_token(saved_token)
 
-# --- 3. LOGIN INTERFACE (SIDEBAR) ---
+# --- 3. LOGIN INTERFACE ---
 with st.sidebar:
     st.header("🔑 Session Manager")
-    if not is_session_active():
+    
+    # Show status
+    if 'access_token' in st.session_state:
+        st.success("✅ Session Active")
+        if st.button("Logout / Clear Cache"):
+            if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
+            st.session_state.clear()
+            st.rerun()
+    else:
         login_url = st.session_state.kite.login_url()
         st.link_button("1. Get Login URL", login_url, use_container_width=True)
-        request_token = st.text_input("2. Enter Request Token")
+        
+        # IMPORTANT: Do not paste the whole URL, just the token after 'request_token='
+        token_input = st.text_input("2. Enter New Request Token")
+        
         if st.button("Activate Session", use_container_width=True):
             try:
-                data = st.session_state.kite.generate_session(request_token, api_secret=API_SECRET)
+                # Clean the input in case user pasted the whole URL
+                clean_token = token_input.split("request_token=")[-1].split("&")[0]
+                data = st.session_state.kite.generate_session(clean_token, api_secret=API_SECRET)
+                
+                # Save to both Session and File
                 st.session_state.access_token = data["access_token"]
-                st.session_state.login_time = datetime.now()
+                with open(TOKEN_FILE, "w") as f:
+                    f.write(data["access_token"])
+                
                 st.session_state.kite.set_access_token(data["access_token"])
-                st.success(f"Welcome {data['user_name']}!")
+                st.success("Login Successful!")
                 st.rerun()
             except Exception as e:
-                st.error(f"Login Failed: {e}")
-    else:
-        st.success("✅ Session Active")
-        st.info(f"Valid until 06:00 AM tomorrow")
-        if st.button("Force Logout"):
-            for key in list(st.session_state.keys()): del st.session_state[key]
-            st.rerun()
+                st.error(f"Login Failed: {e}. Get a NEW token.")
 
-# --- 4. DATA ENGINE (700+ SYMBOLS & CHARTINK LOGIC) ---
-def run_master_sync():
+# --- 4. SCANNER LOGIC (ONLY RUNS IF LOGGED IN) ---
+if 'access_token' in st.session_state:
     try:
-        # Fetch Symbols from your Google Sheet (Scanner_Output 1)
-        # Mirroring Task 5: Pulling all symbols dynamically
-        sheet_data = conn.read(worksheet="Scanner_Output 1", ttl=600) 
+        # Load Symbols from your Sheet
+        sheet_data = conn.read(worksheet="Scanner_Output 1", ttl=600)
         symbols = ["NSE:" + str(s).strip() for s in sheet_data.iloc[:, 0].tolist() if s]
 
+        # Fetch in Chunks (Task 5: 700+ Symbols)
         all_quotes = {}
-        # Fetch in chunks of 450 to handle 700+ symbols safely
         for i in range(0, len(symbols), 450):
             chunk = symbols[i:i+450]
             all_quotes.update(st.session_state.kite.quote(chunk))
         
+        # Process Logic (Task 3: Chartink Volume)
         results = []
-        breakouts = []
+        for s, d in all_quotes.items():
+            change = round(((d['last_price'] - d['ohlc']['close']) / d['ohlc']['close']) * 100, 2)
+            results.append({
+                "Symbol": s.replace("NSE:", ""),
+                "LTP": d['last_price'],
+                "Volume": d['volume'],
+                "Change %": change,
+                "Trend": "🚀 STR" if d['volume'] > 500000 and change >= 1.0 else "Normal"
+            })
+        
+        df = pd.DataFrame(results)
 
-        for symbol, data in all_quotes.items():
-            ltp = data['last_price']
-            close = data['ohlc']['close']
-            vol = data['volume']
-            pct = round(((ltp - close) / close) * 100, 2)
-            
-            # --- TASK 3: CHARTINK VOLUME LOGIC ---
-            # Condition: Vol > 500k AND Change > 1%
-            # Logic also checks if Volume > 1 day ago Max(22) as per your screenshot
-            is_breakout = (vol > 500000) and (pct >= 1.0)
-            
-            # Mirroring Apps Script Smart Trend colors
-            trend = "🟩" if pct > 0 else "🟥"
-            if is_breakout: trend = "🚀 STR"
-            elif pct < -2 and vol > 1000000: trend = "📉 DUMP"
+        # --- THE TABS YOU WERE LOOKING FOR ---
+        t1, t2, t3 = st.tabs(["Scanner 1 (1-250)", "Scanner 2 (251-500)", "Scanner 3 (501+)"])
+        with t1: st.dataframe(df.iloc[:250], use_container_width=True)
+        with t2: st.dataframe(df.iloc[250:500], use_container_width=True)
+        with t3: st.dataframe(df.iloc[500:], use_container_width=True)
 
-            row = {
-                "Symbol": symbol.replace("NSE:", ""),
-                "LTP": ltp,
-                "Change %": pct,
-                "Volume": vol,
-                "Trend": trend,
-                "Time": datetime.now().strftime("%H:%M:%S")
-            }
-            results.append(row)
-            if is_breakout: breakouts.append(row)
+        time.sleep(60)
+        st.rerun()
 
-        return pd.DataFrame(results), pd.DataFrame(breakouts)
     except Exception as e:
-        st.error(f"Sync Error: {e}")
-        return None, None
-
-# --- 5. MAIN DASHBOARD ---
-st.title("📊 Master Omni-Scanner Pro")
-
-if is_session_active():
-    with st.spinner("Fetching Live Data for 700+ Symbols..."):
-        full_df, alert_df = run_master_sync()
-    
-    if full_df is not None:
-        # TASK 1: Mirror 3-Scanner Layout using Tabs
-        tab1, tab2, tab3, tab_alerts = st.tabs(["Scanner 1", "Scanner 2", "Scanner 3", "🔥 Alert Log"])
-        
-        with tab1: st.dataframe(full_df.iloc[:250], use_container_width=True)
-        with tab2: st.dataframe(full_df.iloc[250:500], use_container_width=True)
-        with tab3: st.dataframe(full_df.iloc[500:], use_container_width=True)
-        
-        with tab_alerts:
-            st.subheader("Live Volume & Price Breakouts")
-            if not alert_df.empty:
-                st.table(alert_df)
-                # Auto-append to "Alert_Log" sheet if desired
-                if st.button("💾 Push to Alert_Log Google Sheet"):
-                    log_data = conn.read(worksheet="Alert_Log")
-                    updated_log = pd.concat([log_data, alert_df], ignore_index=True)
-                    conn.update(worksheet="Alert_Log", data=updated_log)
-                    st.toast("Updated Google Sheet!")
-            else:
-                st.info("No volume breakouts detected yet.")
-
-    # Auto-refresh every 60 seconds
-    time.sleep(60)
-    st.rerun()
+        st.error(f"Scanner Error: {e}")
 else:
-    st.info("👋 Please use the Sidebar to Login and start the 700-Symbol Scanner.")
+    st.info("👋 Please complete the Login in the sidebar to load the 700-Symbol Scanners.")
