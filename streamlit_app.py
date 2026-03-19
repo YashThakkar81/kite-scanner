@@ -33,6 +33,10 @@ with st.sidebar:
     st.header("🔑 Session Manager")
     if 'access_token' in st.session_state:
         st.success("✅ Session Active")
+        st.divider()
+        if st.checkbox("📋 Show Token for Google Sheets/Excel"):
+            st.info("Copy this to Cell G2:")
+            st.code(st.session_state.access_token)
         if st.button("Logout / Clear Cache"):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear()
