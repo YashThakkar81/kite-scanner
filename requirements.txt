@@ -2,3 +2,4 @@ streamlit
 kiteconnect
 pandas
 st-gsheets-connection
+pytz
