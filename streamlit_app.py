@@ -23,10 +23,7 @@ def trigger_alert(symbol, alert_type, ltp):
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
-        new Notification("{alert_type} ALERT: {symbol}", {{
-            body: "Price: {ltp}",
-            icon: "https://streamlit.io/favicon.svg"
-        }});
+        new Notification("{alert_type} ALERT: {symbol}", {{ body: "Price: {ltp}" }});
         new Audio('https://media.geeksforgeeks.org/wp-content/uploads/20190531135120/beep.mp3').play();
     }}
     </script>
@@ -46,7 +43,7 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
         st.session_state.access_token = f.read().strip()
         st.session_state.kite.set_access_token(st.session_state.access_token)
 
-# --- 4. CALCULATION UTILS ---
+# --- 4. UTILS ---
 def calculate_ema(prices, period):
     return pd.Series(prices).ewm(span=period, adjust=False).mean().iloc[-1]
 
@@ -64,7 +61,7 @@ def get_daily_max_vol(_kite, symbols):
         except: max_vol_map[s] = 999999999
     return max_vol_map
 
-# --- 5. SIDEBAR & TOOLS ---
+# --- 5. SIDEBAR ---
 with st.sidebar:
     st.header("🔑 Session")
     if 'access_token' not in st.session_state:
@@ -81,7 +78,6 @@ with st.sidebar:
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear(); st.rerun()
     
-    st.divider()
     if st.button("🗑️ Clear Alert History"):
         st.session_state.alerts_history = []
         st.rerun()
@@ -93,7 +89,9 @@ if 'access_token' in st.session_state:
     for ws in sheets:
         try: all_syms.extend(conn.read(worksheet=ws).iloc[:, 0].dropna().astype(str).tolist())
         except: continue
-    symbols = ["NSE:" + s.strip() for s in set(all_syms) if s != 'nan']
+    
+    # CRITICAL: Limit to 100 for stability. 600+ is too many for real-time 15m EMA.
+    symbols = ["NSE:" + s.strip() for s in set(all_syms) if s != 'nan'][:100]
     
     max_vols = get_daily_max_vol(st.session_state.kite, symbols)
     results = []
@@ -120,17 +118,16 @@ if 'access_token' in st.session_state:
                 
                 sym_short = s.replace("NSE:", "")
                 tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
-                curr_time = now.strftime("%H:%M:%S")
-
+                
                 alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
                 if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
                     trigger_alert(sym_short, "Volume", ltp)
-                    st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "Volume", "Time": curr_time, "LTP": ltp, "Chart": tv_url})
+                    st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "Volume", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
                 
                 if is_ema_cross and f"{sym_short}|EMA 20/40" not in alerted_keys:
                     trigger_alert(sym_short, "EMA 20/40", ltp)
-                    st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "EMA 20/40", "Time": curr_time, "LTP": ltp, "Chart": tv_url})
+                    st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "EMA 20/40", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
                 results.append({
                     "Symbol": sym_short, "LTP": ltp, "Change %": pct, 
@@ -143,18 +140,22 @@ if 'access_token' in st.session_state:
 
     progress.empty()
     
-    # --- 7. TABS & RENDERING ---
+    # --- 7. SAFETY RENDER ---
     t_main, t_vol, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "⚡ EMA 15m", "📝 History"])
-    
-    # Column Config for clickable links
     col_config = {"Chart": st.column_config.LinkColumn("View Chart", display_text="Open TV 📈")}
 
-    with t_main: st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True, column_config=col_config)
-    with t_vol: st.dataframe(pd.DataFrame(results)[pd.DataFrame(results)['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
-    with t_ema: st.dataframe(pd.DataFrame(results)[pd.DataFrame(results)['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
+    if results:
+        df_res = pd.DataFrame(results)
+        with t_main: st.dataframe(df_res, use_container_width=True, hide_index=True, column_config=col_config)
+        with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
+        with t_ema: st.dataframe(df_res[df_res['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
+    else:
+        st.warning("No data returned from scan. Check your symbol list or Kite connection.")
+
     with t_log: 
         if st.session_state.alerts_history:
             st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
+        else: st.info("Waiting for signals...")
 
     time.sleep(60)
     st.rerun()
