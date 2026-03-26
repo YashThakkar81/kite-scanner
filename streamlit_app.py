@@ -60,21 +60,19 @@ def get_daily_max_vol(_kite, symbols):
         except: max_vol_map[s] = 999999999
     return max_vol_map
 
-# --- 5. SIDEBAR (STATIONARY LOGIN & SYNC) ---
+# --- 5. SIDEBAR ---
 with st.sidebar:
+    st.header("🕒 Scanner Status")
+    st.info(f"Last Updated: {datetime.now().strftime('%H:%M:%S')}")
+    
+    st.divider()
     st.header("🔑 Session Manager")
     
     if 'access_token' not in st.session_state:
-        # Step 1: Get URL
         st.link_button("1. Get Login URL", st.session_state.kite.login_url(), use_container_width=True)
-        
-        # Step 2: Input Request Token
         token_in = st.text_input("2. Enter Request Token")
-        
-        # Step 3: Activate Session
         if st.button("🚀 Activate Session", use_container_width=True):
             try:
-                # Clean URL if user pasted the whole link
                 clean_token = token_in.split("request_token=")[-1].split("&")[0]
                 data = st.session_state.kite.generate_session(clean_token, api_secret=API_SECRET)
                 st.session_state.access_token = data["access_token"]
@@ -86,12 +84,11 @@ with st.sidebar:
                 st.error(f"Activation Failed: {e}")
     else:
         st.success("✅ Kite Connected")
-        
-        # NEW: Option to copy the Access Token for your Google Sheets Scanner
-        st.info("💡 Reuse this token for Google Sheets:")
+        st.write("---")
+        st.subheader("📋 Share Token to G-Sheets")
         st.code(st.session_state.access_token, language="text")
         
-        if st.button("Logout / Reset Session", use_container_width=True):
+        if st.button("Logout / Reset", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear()
             st.rerun()
@@ -103,7 +100,6 @@ with st.sidebar:
 
 # --- 6. DATA PROCESSING ---
 if 'access_token' in st.session_state:
-    # Fetch symbols from Google Sheets
     sheets = ["Scanner_Output 1", "Scanner_Output 2", "Scanner_Output 3"]
     all_syms = []
     for ws in sheets:
@@ -112,11 +108,10 @@ if 'access_token' in st.session_state:
             all_syms.extend(data)
         except: continue
     
-    # Using top 100 for speed during next-day test
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s != 'nan'][:100]
     
     if not symbols:
-        st.warning("No symbols found in Google Sheets. Check tab names.")
+        st.warning("No symbols found in Google Sheets.")
         st.stop()
 
     max_vols = get_daily_max_vol(st.session_state.kite, symbols)
@@ -132,7 +127,6 @@ if 'access_token' in st.session_state:
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
             
-            # Fetch 15m candles
             hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now-timedelta(days=2), now, "15minute")
             df_15m = pd.DataFrame(hist_15m)
             
@@ -146,7 +140,6 @@ if 'access_token' in st.session_state:
                 sym_short = s.replace("NSE:", "")
                 tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
                 
-                # Deduplication logic for alerts
                 alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
                 if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
@@ -178,7 +171,7 @@ if 'access_token' in st.session_state:
         with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
         with t_ema: st.dataframe(df_res[df_res['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
     else:
-        st.warning("Scanning complete. No breakout conditions met at this moment.")
+        st.warning("No breakout conditions detected in this cycle.")
 
     with t_log: 
         if st.session_state.alerts_history:
