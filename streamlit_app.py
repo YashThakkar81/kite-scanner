@@ -5,17 +5,21 @@ from streamlit_gsheets import GSheetsConnection
 import streamlit.components.v1 as components
 import time
 import os
+import pytz  # Required for IST Timezone
 from datetime import datetime, timedelta
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
+
+# Define Timezone
+IST = pytz.timezone('Asia/Kolkata')
 
 try:
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error(f"Setup Error: {e}")
+    st.error(f"Setup Error: Check .streamlit/secrets.toml. Error: {e}")
     st.stop()
 
 # --- 2. NOTIFICATION ENGINE ---
@@ -29,6 +33,7 @@ def trigger_alert(symbol, alert_type, ltp):
     </script>
     """
     components.html(notification_js, height=0)
+    st.toast(f"{alert_type}: {symbol}", icon="🚀")
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
@@ -39,8 +44,9 @@ if 'alerts_history' not in st.session_state:
 TOKEN_FILE = "access_token.txt"
 if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
     with open(TOKEN_FILE, "r") as f:
-        st.session_state.access_token = f.read().strip()
-        st.session_state.kite.set_access_token(st.session_state.access_token)
+        token = f.read().strip()
+        st.session_state.access_token = token
+        st.session_state.kite.set_access_token(token)
 
 # --- 4. UTILS ---
 def calculate_ema(prices, period):
@@ -49,7 +55,7 @@ def calculate_ema(prices, period):
 @st.cache_data(ttl="1d")
 def get_daily_max_vol(_kite, symbols):
     max_vol_map = {}
-    to_date = datetime.now().date()
+    to_date = datetime.now(IST).date()
     from_date = to_date - timedelta(days=35)
     quotes = _kite.quote(symbols)
     for s, d in quotes.items():
@@ -60,10 +66,12 @@ def get_daily_max_vol(_kite, symbols):
         except: max_vol_map[s] = 999999999
     return max_vol_map
 
-# --- 5. SIDEBAR ---
+# --- 5. SIDEBAR (STATIONARY LOGIN & IST TIMER) ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
-    st.info(f"Last Updated: {datetime.now().strftime('%H:%M:%S')}")
+    # Updated to IST
+    ist_now = datetime.now(IST).strftime('%H:%M:%S')
+    st.info(f"Last Updated: {ist_now} (IST)")
     
     st.divider()
     st.header("🔑 Session Manager")
@@ -84,14 +92,11 @@ with st.sidebar:
                 st.error(f"Activation Failed: {e}")
     else:
         st.success("✅ Kite Connected")
-        st.write("---")
-        st.subheader("📋 Share Token to G-Sheets")
+        st.subheader("📋 Share Token")
         st.code(st.session_state.access_token, language="text")
-        
         if st.button("Logout / Reset", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
-            st.session_state.clear()
-            st.rerun()
+            st.session_state.clear(); st.rerun()
     
     st.divider()
     if st.button("🗑️ Clear Alert History", use_container_width=True):
@@ -108,6 +113,7 @@ if 'access_token' in st.session_state:
             all_syms.extend(data)
         except: continue
     
+    # Symbols Capped at 100 for 15m TF performance
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s != 'nan'][:100]
     
     if not symbols:
@@ -116,7 +122,7 @@ if 'access_token' in st.session_state:
 
     max_vols = get_daily_max_vol(st.session_state.kite, symbols)
     results = []
-    now = datetime.now()
+    now = datetime.now(IST)
     
     progress = st.empty()
     progress.info(f"Scanning {len(symbols)} Stocks...")
@@ -127,6 +133,7 @@ if 'access_token' in st.session_state:
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
             
+            # Fetch 15m candles
             hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now-timedelta(days=2), now, "15minute")
             df_15m = pd.DataFrame(hist_15m)
             
@@ -171,7 +178,7 @@ if 'access_token' in st.session_state:
         with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
         with t_ema: st.dataframe(df_res[df_res['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
     else:
-        st.warning("No breakout conditions detected in this cycle.")
+        st.warning("Scanning complete. No live breakout signals found.")
 
     with t_log: 
         if st.session_state.alerts_history:
