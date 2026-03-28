@@ -6,31 +6,20 @@ import streamlit.components.v1 as components
 import time
 import os
 import pytz 
+import requests  # Required for Telegram API
 from datetime import datetime, timedelta
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- NEW: CSS FOR GLOBAL CENTER ALIGNMENT ---
+# --- CSS FOR GLOBAL CENTER ALIGNMENT ---
 st.markdown("""
     <style>
-    /* Centers text in all table cells */
-    [data-testid="stDataFrame"] td {
-        text-align: center !important;
-    }
-    /* Centers text in all table headers */
-    [data-testid="stHeader"] th {
-        text-align: center !important;
-    }
-    /* Centers the content within link columns */
-    [data-testid="stDataFrame"] a {
-        justify-content: center !important;
-    }
-    /* Centers the container for dataframes */
-    .stDataFrame {
-        margin: 0 auto;
-    }
+    [data-testid="stDataFrame"] td { text-align: center !important; }
+    [data-testid="stHeader"] th { text-align: center !important; }
+    [data-testid="stDataFrame"] a { justify-content: center !important; }
+    .stDataFrame { margin: 0 auto; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -58,6 +47,14 @@ def trigger_alert(symbol, alert_type, ltp):
     """
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
+
+def send_telegram_msg(token, chat_id, message):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except:
+        pass
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
@@ -100,6 +97,13 @@ with st.sidebar:
         components.html("<script>Notification.requestPermission();</script>", height=0)
         st.success("Permission Requested!")
 
+    st.divider()
+    st.header("📲 Telegram Alerts")
+    tg_toggle = st.toggle("Enable Telegram Mode", value=False)
+    if tg_toggle:
+        tg_token = st.text_input("Bot Token", type="password", help="Get from @BotFather")
+        tg_chat_id = st.text_input("Chat ID", help="Get from @userinfobot")
+    
     st.divider()
     if 'access_token' not in st.session_state:
         st.link_button("1. Get Login URL", st.session_state.kite.login_url(), use_container_width=True)
@@ -172,13 +176,19 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
-                trigger_alert(sym_short, "Volume", ltp)
-                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "Volume", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
-            
-            if is_ema_cross and f"{sym_short}|EMA 20/50" not in alerted_keys:
-                trigger_alert(sym_short, "EMA 20/50", ltp)
-                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "EMA 20/50", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
+            # ALERT LOGIC (Desktop + Telegram)
+            if (is_vol_break and f"{sym_short}|Volume" not in alerted_keys) or \
+               (is_ema_cross and f"{sym_short}|EMA 20/50" not in alerted_keys):
+                
+                alert_type = "Volume" if is_vol_break else "EMA 20/50"
+                trigger_alert(sym_short, alert_type, ltp)
+                
+                # Telegram Dispatch
+                if tg_toggle and tg_token and tg_chat_id:
+                    tg_msg = f"🚀 <b>{alert_type} ALERT</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
+                    send_telegram_msg(tg_token, tg_chat_id, tg_msg)
+
+                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
             results.append({
                 "Symbol": sym_short, "LTP": ltp, "Change %": pct, 
@@ -192,7 +202,6 @@ if 'access_token' in st.session_state:
     
     # --- 7. TABS ---
     t_main, t_vol, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "⚡ EMA 15m", "📝 History"])
-    
     col_config = {
         "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
         "LTP": st.column_config.NumberColumn("LTP", format="%.2f", width="small"),
@@ -203,12 +212,7 @@ if 'access_token' in st.session_state:
     }
 
     def display_styled_df(df):
-        st.dataframe(
-            df, 
-            use_container_width=True, 
-            hide_index=True, 
-            column_config=col_config
-        )
+        st.dataframe(df, use_container_width=True, hide_index=True, column_config=col_config)
 
     if results:
         df_res = pd.DataFrame(results)
