@@ -5,13 +5,11 @@ from streamlit_gsheets import GSheetsConnection
 import streamlit.components.v1 as components
 import time
 import os
-import pytz  # Required for IST Timezone
+import pytz 
 from datetime import datetime, timedelta
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
-
-# Define Timezone
 IST = pytz.timezone('Asia/Kolkata')
 
 try:
@@ -24,11 +22,16 @@ except Exception as e:
 
 # --- 2. NOTIFICATION ENGINE ---
 def trigger_alert(symbol, alert_type, ltp):
+    # Added auto-close and error handling to the JS
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
-        new Notification("{alert_type} ALERT: {symbol}", {{ body: "Price: {ltp}" }});
+        const n = new Notification("{alert_type} ALERT: {symbol}", {{ 
+            body: "Price: {ltp}",
+            icon: "https://kite.zerodha.com/static/images/kite-logo.svg" 
+        }});
         new Audio('https://media.geeksforgeeks.org/wp-content/uploads/20190531135120/beep.mp3').play();
+        setTimeout(() => n.close(), 5000);
     }}
     </script>
     """
@@ -48,34 +51,37 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
         st.session_state.access_token = token
         st.session_state.kite.set_access_token(token)
 
-# --- 4. UTILS ---
+# --- 4. UTILS (Fixed EMA 20/50 & Avg Volume) ---
 def calculate_ema(prices, period):
     return pd.Series(prices).ewm(span=period, adjust=False).mean().iloc[-1]
 
 @st.cache_data(ttl="1d")
-def get_daily_max_vol(_kite, symbols):
-    max_vol_map = {}
+def get_daily_avg_vol(_kite, symbols):
+    avg_vol_map = {}
     to_date = datetime.now(IST).date()
     from_date = to_date - timedelta(days=35)
-    quotes = _kite.quote(symbols)
-    for s, d in quotes.items():
+    for s in symbols:
         try:
-            hist = _kite.historical_data(d['instrument_token'], from_date, to_date - timedelta(days=1), "day")
-            max_vol_map[s] = max([day['volume'] for day in hist[-22:]]) if len(hist) >= 22 else 999999999
-            time.sleep(0.1) 
-        except: max_vol_map[s] = 999999999
-    return max_vol_map
+            q = _kite.quote(s)[s]
+            hist = _kite.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
+            # Logic Change: Using Average (Mean) of 22 days to match Google Sheet
+            avg_vol_map[s] = sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
+            time.sleep(0.05) 
+        except: avg_vol_map[s] = 999999999
+    return avg_vol_map
 
-# --- 5. SIDEBAR (STATIONARY LOGIN & IST TIMER) ---
+# --- 5. SIDEBAR ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
-    # Updated to IST
     ist_now = datetime.now(IST).strftime('%H:%M:%S')
     st.info(f"Last Updated: {ist_now} (IST)")
     
+    # CRITICAL: Permission Requester
+    if st.button("🔔 Enable Desktop Alerts"):
+        components.html("<script>Notification.requestPermission();</script>", height=0)
+        st.success("Permission Requested!")
+
     st.divider()
-    st.header("🔑 Session Manager")
-    
     if 'access_token' not in st.session_state:
         st.link_button("1. Get Login URL", st.session_state.kite.login_url(), use_container_width=True)
         token_in = st.text_input("2. Enter Request Token")
@@ -86,14 +92,10 @@ with st.sidebar:
                 st.session_state.access_token = data["access_token"]
                 with open(TOKEN_FILE, "w") as f: f.write(data["access_token"])
                 st.session_state.kite.set_access_token(data["access_token"])
-                st.success("Session Activated!")
                 st.rerun()
-            except Exception as e:
-                st.error(f"Activation Failed: {e}")
+            except Exception as e: st.error(f"Error: {e}")
     else:
         st.success("✅ Kite Connected")
-        st.subheader("📋 Share Token")
-        st.code(st.session_state.access_token, language="text")
         if st.button("Logout / Reset", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear(); st.rerun()
@@ -109,61 +111,66 @@ if 'access_token' in st.session_state:
     all_syms = []
     for ws in sheets:
         try:
-            data = conn.read(worksheet=ws).iloc[:, 0].dropna().astype(str).tolist()
-            all_syms.extend(data)
+            df_sheet = conn.read(worksheet=ws)
+            if not df_sheet.empty:
+                data = df_sheet.iloc[:, 0].dropna().astype(str).tolist()
+                all_syms.extend(data)
         except: continue
     
-    # Symbols Capped at 100 for 15m TF performance
-    symbols = ["NSE:" + s.strip() for s in set(all_syms) if s != 'nan'][:100]
+    # Using set() to remove duplicates from different scanner pages
+    symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
     
     if not symbols:
         st.warning("No symbols found in Google Sheets.")
         st.stop()
 
-    max_vols = get_daily_max_vol(st.session_state.kite, symbols)
+    avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
     results = []
     now = datetime.now(IST)
     
     progress = st.empty()
-    progress.info(f"Scanning {len(symbols)} Stocks...")
+    progress.info(f"Scanning {len(symbols)} Stocks (EMA 20/50)...")
+
+    # Fetch quotes in one bulk call (faster + quota friendly)
+    full_quotes = st.session_state.kite.quote(symbols)
 
     for s in symbols:
         try:
-            q = st.session_state.kite.quote(s)[s]
+            q = full_quotes[s]
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
             
-            # Fetch 15m candles
-            hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now-timedelta(days=2), now, "15minute")
-            df_15m = pd.DataFrame(hist_15m)
+            # Condition 1: Volume Check (Matches Google Sheet Logic)
+            is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             
-            if len(df_15m) >= 40:
-                ema20 = calculate_ema(df_15m['close'], 20)
-                ema40 = calculate_ema(df_15m['close'], 40)
-                
-                is_ema_cross = ema20 > ema40
-                is_vol_break = (vol > 500000 and pct > 1.0 and vol > max_vols.get(s, 0))
-                
-                sym_short = s.replace("NSE:", "")
-                tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
-                
-                alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
+            # Condition 2: EMA Check (Only fetch 15m data if Volume is high to save time)
+            is_ema_cross = False
+            if is_vol_break or pct > 0.5: # Efficiency: only check EMA for promising stocks
+                hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now-timedelta(days=4), now, "15minute")
+                df_15m = pd.DataFrame(hist_15m)
+                if len(df_15m) >= 55:
+                    ema20 = calculate_ema(df_15m['close'], 20)
+                    ema50 = calculate_ema(df_15m['close'], 50) # Updated to 50
+                    is_ema_cross = ema20 > ema50
+            
+            sym_short = s.replace("NSE:", "")
+            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
+            alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-                if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
-                    trigger_alert(sym_short, "Volume", ltp)
-                    st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "Volume", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
-                
-                if is_ema_cross and f"{sym_short}|EMA 20/40" not in alerted_keys:
-                    trigger_alert(sym_short, "EMA 20/40", ltp)
-                    st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "EMA 20/40", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
+            if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
+                trigger_alert(sym_short, "Volume", ltp)
+                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "Volume", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
+            
+            if is_ema_cross and f"{sym_short}|EMA 20/50" not in alerted_keys:
+                trigger_alert(sym_short, "EMA 20/50", ltp)
+                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "EMA 20/50", "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
-                results.append({
-                    "Symbol": sym_short, "LTP": ltp, "Change %": pct, 
-                    "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal",
-                    "EMA Status": "⚡ CROSS" if is_ema_cross else "Below",
-                    "Chart": tv_url
-                })
-            time.sleep(0.05) 
+            results.append({
+                "Symbol": sym_short, "LTP": ltp, "Change %": pct, 
+                "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal",
+                "EMA Status": "⚡ CROSS" if is_ema_cross else "Below",
+                "Chart": tv_url
+            })
         except: continue
 
     progress.empty()
@@ -177,13 +184,10 @@ if 'access_token' in st.session_state:
         with t_main: st.dataframe(df_res, use_container_width=True, hide_index=True, column_config=col_config)
         with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
         with t_ema: st.dataframe(df_res[df_res['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
-    else:
-        st.warning("Scanning complete. No live breakout signals found.")
-
+    
     with t_log: 
         if st.session_state.alerts_history:
             st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
-        else: st.info("Waiting for market signals...")
 
     time.sleep(60)
     st.rerun()
