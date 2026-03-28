@@ -12,6 +12,28 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
 
+# --- NEW: CSS FOR GLOBAL CENTER ALIGNMENT ---
+st.markdown("""
+    <style>
+    /* Centers text in all table cells */
+    [data-testid="stDataFrame"] td {
+        text-align: center !important;
+    }
+    /* Centers text in all table headers */
+    [data-testid="stHeader"] th {
+        text-align: center !important;
+    }
+    /* Centers the content within link columns */
+    [data-testid="stDataFrame"] a {
+        justify-content: center !important;
+    }
+    /* Centers the container for dataframes */
+    .stDataFrame {
+        margin: 0 auto;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 try:
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
@@ -22,7 +44,6 @@ except Exception as e:
 
 # --- 2. NOTIFICATION ENGINE ---
 def trigger_alert(symbol, alert_type, ltp):
-    # Added auto-close and error handling to the JS
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
@@ -51,7 +72,7 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
         st.session_state.access_token = token
         st.session_state.kite.set_access_token(token)
 
-# --- 4. UTILS (Fixed EMA 20/50 & Avg Volume) ---
+# --- 4. UTILS ---
 def calculate_ema(prices, period):
     return pd.Series(prices).ewm(span=period, adjust=False).mean().iloc[-1]
 
@@ -64,7 +85,6 @@ def get_daily_avg_vol(_kite, symbols):
         try:
             q = _kite.quote(s)[s]
             hist = _kite.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
-            # Logic Change: Using Average (Mean) of 22 days to match Google Sheet
             avg_vol_map[s] = sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
             time.sleep(0.05) 
         except: avg_vol_map[s] = 999999999
@@ -76,7 +96,6 @@ with st.sidebar:
     ist_now = datetime.now(IST).strftime('%H:%M:%S')
     st.info(f"Last Updated: {ist_now} (IST)")
     
-    # CRITICAL: Permission Requester
     if st.button("🔔 Enable Desktop Alerts"):
         components.html("<script>Notification.requestPermission();</script>", height=0)
         st.success("Permission Requested!")
@@ -117,7 +136,6 @@ if 'access_token' in st.session_state:
                 all_syms.extend(data)
         except: continue
     
-    # Using set() to remove duplicates from different scanner pages
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
     
     if not symbols:
@@ -131,7 +149,6 @@ if 'access_token' in st.session_state:
     progress = st.empty()
     progress.info(f"Scanning {len(symbols)} Stocks (EMA 20/50)...")
 
-    # Fetch quotes in one bulk call (faster + quota friendly)
     full_quotes = st.session_state.kite.quote(symbols)
 
     for s in symbols:
@@ -140,17 +157,15 @@ if 'access_token' in st.session_state:
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
             
-            # Condition 1: Volume Check (Matches Google Sheet Logic)
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
-            
-            # Condition 2: EMA Check (Only fetch 15m data if Volume is high to save time)
             is_ema_cross = False
-            if is_vol_break or pct > 0.5: # Efficiency: only check EMA for promising stocks
+            
+            if is_vol_break or pct > 0.5: 
                 hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now-timedelta(days=4), now, "15minute")
                 df_15m = pd.DataFrame(hist_15m)
                 if len(df_15m) >= 55:
                     ema20 = calculate_ema(df_15m['close'], 20)
-                    ema50 = calculate_ema(df_15m['close'], 50) # Updated to 50
+                    ema50 = calculate_ema(df_15m['close'], 50) 
                     is_ema_cross = ema20 > ema50
             
             sym_short = s.replace("NSE:", "")
@@ -175,22 +190,19 @@ if 'access_token' in st.session_state:
 
     progress.empty()
     
-    # --- 7. TABS (Centered & Formatted) ---
+    # --- 7. TABS ---
     t_main, t_vol, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "⚡ EMA 15m", "📝 History"])
     
-    # Custom Configuration for Centering and Formatting
     col_config = {
-        "Symbol": st.column_config.TextColumn("Symbol", help="Stock Name", width="medium"),
-        "LTP": st.column_config.NumberColumn("LTP", format="%.2f", help="Last Traded Price"),
-        "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%", help="Daily Percentage Change"),
-        "Vol Status": st.column_config.TextColumn("Vol Status", width="small"),
-        "EMA Status": st.column_config.TextColumn("EMA Status", width="small"),
-        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
+        "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
+        "LTP": st.column_config.NumberColumn("LTP", format="%.2f", width="small"),
+        "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%", width="small"),
+        "Vol Status": st.column_config.TextColumn("Vol Status", width="medium"),
+        "EMA Status": st.column_config.TextColumn("EMA Status", width="medium"),
+        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈", width="small")
     }
 
-    # Helper function to display dataframes with centered alignment via CSS
     def display_styled_df(df):
-        # We use st.dataframe but apply the config which handles numeric centering automatically
         st.dataframe(
             df, 
             use_container_width=True, 
@@ -208,7 +220,9 @@ if 'access_token' in st.session_state:
 
     with t_log: 
         if st.session_state.alerts_history:
-            # For history, we also center the LTP and Time
             history_config = col_config.copy()
             history_config["Time"] = st.column_config.TextColumn("Time")
             st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=history_config)
+
+    time.sleep(60)
+    st.rerun()
