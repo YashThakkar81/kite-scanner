@@ -175,19 +175,40 @@ if 'access_token' in st.session_state:
 
     progress.empty()
     
-    # --- 7. TABS ---
+    # --- 7. TABS (Centered & Formatted) ---
     t_main, t_vol, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "⚡ EMA 15m", "📝 History"])
-    col_config = {"Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")}
+    
+    # Custom Configuration for Centering and Formatting
+    col_config = {
+        "Symbol": st.column_config.TextColumn("Symbol", help="Stock Name", width="medium"),
+        "LTP": st.column_config.NumberColumn("LTP", format="%.2f", help="Last Traded Price"),
+        "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%", help="Daily Percentage Change"),
+        "Vol Status": st.column_config.TextColumn("Vol Status", width="small"),
+        "EMA Status": st.column_config.TextColumn("EMA Status", width="small"),
+        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
+    }
+
+    # Helper function to display dataframes with centered alignment via CSS
+    def display_styled_df(df):
+        # We use st.dataframe but apply the config which handles numeric centering automatically
+        st.dataframe(
+            df, 
+            use_container_width=True, 
+            hide_index=True, 
+            column_config=col_config
+        )
 
     if results:
         df_res = pd.DataFrame(results)
-        with t_main: st.dataframe(df_res, use_container_width=True, hide_index=True, column_config=col_config)
-        with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
-        with t_ema: st.dataframe(df_res[df_res['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
-    
+        with t_main: display_styled_df(df_res)
+        with t_vol: display_styled_df(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"])
+        with t_ema: display_styled_df(df_res[df_res['EMA Status'] == "⚡ CROSS"])
+    else:
+        st.warning("Scanning complete. No live breakout signals found.")
+
     with t_log: 
         if st.session_state.alerts_history:
-            st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
-
-    time.sleep(60)
-    st.rerun()
+            # For history, we also center the LTP and Time
+            history_config = col_config.copy()
+            history_config["Time"] = st.column_config.TextColumn("Time")
+            st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=history_config)
