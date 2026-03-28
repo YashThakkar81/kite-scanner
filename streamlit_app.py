@@ -26,9 +26,11 @@ st.markdown("""
 try:
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
-    # Pulling Telegram Credentials from Secrets
-    TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
-    TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
+    
+    # SAFELY RETRIEVING TELEGRAM SECRETS
+    # .get() prevents the app from crashing if they are missing
+    TG_TOKEN = st.secrets.get("TELEGRAM_TOKEN")
+    TG_ID = st.secrets.get("TELEGRAM_CHAT_ID")
     
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
@@ -70,10 +72,13 @@ if 'alerts_history' not in st.session_state:
 
 TOKEN_FILE = "access_token.txt"
 if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
-    with open(TOKEN_FILE, "r") as f:
-        token = f.read().strip()
-        st.session_state.access_token = token
-        st.session_state.kite.set_access_token(token)
+    try:
+        with open(TOKEN_FILE, "r") as f:
+            token = f.read().strip()
+            st.session_state.access_token = token
+            st.session_state.kite.set_access_token(token)
+    except:
+        pass
 
 # --- 4. UTILS ---
 def calculate_ema(prices, period):
@@ -107,11 +112,12 @@ with st.sidebar:
     st.header("📲 Telegram Alerts")
     tg_toggle = st.toggle("Enable Telegram Mode", value=True)
     
+    # Logic to display status based on Secrets
     if tg_toggle:
-        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        if TG_TOKEN and TG_ID:
             st.success("✅ Telegram Linked")
             if st.button("🔔 Send Test Message"):
-                send_telegram_msg(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "<b>Scanner Online!</b> 🚀\nTelegram connection verified successfully.")
+                send_telegram_msg(TG_TOKEN, TG_ID, f"<b>Connection Verified!</b> 🚀\nTime: {ist_now}")
                 st.toast("Test Message Sent!")
         else:
             st.warning("⚠️ Secrets Missing: Add TELEGRAM_TOKEN and TELEGRAM_CHAT_ID to settings.")
@@ -165,7 +171,11 @@ if 'access_token' in st.session_state:
     progress = st.empty()
     progress.info(f"Scanning {len(symbols)} Stocks (EMA 20/50)...")
 
-    full_quotes = st.session_state.kite.quote(symbols)
+    try:
+        full_quotes = st.session_state.kite.quote(symbols)
+    except:
+        st.error("Kite Session Expired. Please Login again.")
+        st.stop()
 
     for s in symbols:
         try:
@@ -194,10 +204,10 @@ if 'access_token' in st.session_state:
                 alert_type = "Volume" if is_vol_break else "EMA 20/50"
                 trigger_alert(sym_short, alert_type, ltp)
                 
-                # Automated Telegram Dispatch from Secrets
-                if tg_toggle and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                # SEND TELEGRAM
+                if tg_toggle and TG_TOKEN and TG_ID:
                     tg_msg = f"🚀 <b>{alert_type} ALERT</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
-                    send_telegram_msg(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, tg_msg)
+                    send_telegram_msg(TG_TOKEN, TG_ID, tg_msg)
 
                 st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
@@ -227,6 +237,8 @@ if 'access_token' in st.session_state:
 
     if results:
         df_res = pd.DataFrame(results)
+        # Apply sorting by Change % as seen in your screenshots
+        df_res = df_res.sort_values(by="Change %", ascending=False)
         with t_main: display_styled_df(df_res)
         with t_vol: display_styled_df(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"])
         with t_ema: display_styled_df(df_res[df_res['EMA Status'] == "⚡ CROSS"])
