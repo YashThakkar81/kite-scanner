@@ -6,7 +6,7 @@ import streamlit.components.v1 as components
 import time
 import os
 import pytz 
-import requests  # Required for Telegram API
+import requests 
 from datetime import datetime, timedelta
 
 # --- 1. CONFIGURATION ---
@@ -26,6 +26,10 @@ st.markdown("""
 try:
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
+    # Pulling Telegram Credentials from Secrets
+    TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
+    
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
     st.error(f"Setup Error: Check .streamlit/secrets.toml. Error: {e}")
@@ -49,6 +53,8 @@ def trigger_alert(symbol, alert_type, ltp):
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
 
 def send_telegram_msg(token, chat_id, message):
+    if not token or not chat_id:
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     try:
@@ -99,10 +105,16 @@ with st.sidebar:
 
     st.divider()
     st.header("📲 Telegram Alerts")
-    tg_toggle = st.toggle("Enable Telegram Mode", value=False)
+    tg_toggle = st.toggle("Enable Telegram Mode", value=True)
+    
     if tg_toggle:
-        tg_token = st.text_input("Bot Token", type="password", help="Get from @BotFather")
-        tg_chat_id = st.text_input("Chat ID", help="Get from @userinfobot")
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            st.success("✅ Telegram Linked")
+            if st.button("🔔 Send Test Message"):
+                send_telegram_msg(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "<b>Scanner Online!</b> 🚀\nTelegram connection verified successfully.")
+                st.toast("Test Message Sent!")
+        else:
+            st.warning("⚠️ Secrets Missing: Add TELEGRAM_TOKEN and TELEGRAM_CHAT_ID to settings.")
     
     st.divider()
     if 'access_token' not in st.session_state:
@@ -176,17 +188,16 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # ALERT LOGIC (Desktop + Telegram)
             if (is_vol_break and f"{sym_short}|Volume" not in alerted_keys) or \
                (is_ema_cross and f"{sym_short}|EMA 20/50" not in alerted_keys):
                 
                 alert_type = "Volume" if is_vol_break else "EMA 20/50"
                 trigger_alert(sym_short, alert_type, ltp)
                 
-                # Telegram Dispatch
-                if tg_toggle and tg_token and tg_chat_id:
+                # Automated Telegram Dispatch from Secrets
+                if tg_toggle and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                     tg_msg = f"🚀 <b>{alert_type} ALERT</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
-                    send_telegram_msg(tg_token, tg_chat_id, tg_msg)
+                    send_telegram_msg(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, tg_msg)
 
                 st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
