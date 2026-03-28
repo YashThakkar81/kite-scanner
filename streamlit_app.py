@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- CSS FOR GLOBAL CENTER ALIGNMENT ---
 st.markdown("""
     <style>
     [data-testid="stDataFrame"] td { text-align: center !important; }
@@ -24,17 +23,13 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 try:
-    # Essential API Keys
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
-    
-    # Telegram Credentials from Secrets
     TG_TOKEN = st.secrets.get("TELEGRAM_TOKEN")
     TG_ID = st.secrets.get("TELEGRAM_CHAT_ID")
-    
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error(f"Setup Error: Check your Secrets dashboard. Error: {e}")
+    st.error(f"Setup Error: {e}")
     st.stop()
 
 # --- 2. NOTIFICATION ENGINE ---
@@ -55,14 +50,13 @@ def trigger_alert(symbol, alert_type, ltp):
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
 
 def send_telegram_msg(token, chat_id, message):
-    if not token or not chat_id:
-        return
+    if not token or not chat_id: return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False}
     try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        st.sidebar.error(f"Telegram Error: {e}")
+        resp = requests.post(url, json=payload, timeout=8)
+        return resp.status_code == 200
+    except: return False
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
@@ -100,8 +94,13 @@ def get_daily_avg_vol(_kite, symbols):
 # --- 5. SIDEBAR ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
-    ist_now = datetime.now(IST).strftime('%H:%M:%S')
-    st.info(f"Last Updated: {ist_now} (IST)")
+    now_ist = datetime.now(IST)
+    st.info(f"Last Updated: {now_ist.strftime('%H:%M:%S')}")
+    
+    # Market Status Indicator
+    is_weekend = now_ist.weekday() >= 5
+    if is_weekend:
+        st.warning("Market is Closed (Weekend)")
     
     if st.button("🔔 Enable Desktop Alerts"):
         components.html("<script>Notification.requestPermission();</script>", height=0)
@@ -110,15 +109,15 @@ with st.sidebar:
     st.divider()
     st.header("📲 Telegram Alerts")
     tg_toggle = st.toggle("Enable Telegram Mode", value=True)
-    
     if tg_toggle:
         if TG_TOKEN and TG_ID:
             st.success("✅ Telegram Linked")
             if st.button("🔔 Send Test Message"):
-                send_telegram_msg(TG_TOKEN, TG_ID, f"<b>Connection Verified!</b> 🚀\nYour scanner is ready for the market.")
-                st.toast("Check your Telegram!")
+                success = send_telegram_msg(TG_TOKEN, TG_ID, "<b>Scanner Test</b>: Connection working! 🚀")
+                if success: st.toast("Sent! Check Telegram.")
+                else: st.error("Failed. Check Chat ID/Bot Start.")
         else:
-            st.warning("⚠️ Secrets Missing: Add TELEGRAM_TOKEN and TELEGRAM_CHAT_ID to settings.")
+            st.warning("⚠️ Secrets Missing.")
     
     st.divider()
     if 'access_token' not in st.session_state:
@@ -164,7 +163,6 @@ if 'access_token' in st.session_state:
 
     avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
     results = []
-    now = datetime.now(IST)
     
     progress = st.empty()
     progress.info(f"Scanning {len(symbols)} Stocks...")
@@ -172,7 +170,7 @@ if 'access_token' in st.session_state:
     try:
         full_quotes = st.session_state.kite.quote(symbols)
     except:
-        st.error("Kite Session Expired. Please Login.")
+        st.error("Session Expired.")
         st.stop()
 
     for s in symbols:
@@ -184,8 +182,9 @@ if 'access_token' in st.session_state:
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             is_ema_cross = False
             
+            # EMA Logic triggered only on movement
             if is_vol_break or pct > 0.5: 
-                hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now-timedelta(days=4), now, "15minute")
+                hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
                 df_15m = pd.DataFrame(hist_15m)
                 if len(df_15m) >= 55:
                     ema20 = calculate_ema(df_15m['close'], 20)
@@ -206,7 +205,7 @@ if 'access_token' in st.session_state:
                     tg_msg = f"🚀 <b>{alert_type} ALERT</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
                     send_telegram_msg(TG_TOKEN, TG_ID, tg_msg)
 
-                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
+                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now_ist.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
             results.append({
                 "Symbol": sym_short, "LTP": ltp, "Change %": pct, 
@@ -218,7 +217,6 @@ if 'access_token' in st.session_state:
 
     progress.empty()
     
-    # --- 7. TABS ---
     t_main, t_vol, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "⚡ EMA 15m", "📝 History"])
     col_config = {
         "Symbol": st.column_config.TextColumn("Symbol"),
