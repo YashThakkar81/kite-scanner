@@ -50,13 +50,17 @@ def trigger_alert(symbol, alert_type, ltp):
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
 
 def send_telegram_msg(token, chat_id, message):
-    if not token or not chat_id: return
+    if not token or not chat_id: return False
+    # Clean the chat_id in case it was passed as a string with spaces
+    chat_id = str(chat_id).strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False}
     try:
-        resp = requests.post(url, json=payload, timeout=8)
+        resp = requests.post(url, json=payload, timeout=10)
         return resp.status_code == 200
-    except: return False
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+        return False
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
@@ -73,15 +77,12 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
             st.session_state.access_token = saved_token
     except: pass
 
-# --- 4. UTILS & INDICATORS ---
+# --- 4. INDICATOR CALCS ---
 def calculate_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_bb_median_status(df, period=20, offset=6):
-    """Calculates BB Median using EMA basis with specified offset."""
-    # Basis MA Type: EMA as requested
     ema_basis = calculate_ema(df['close'], period)
-    # Apply Offset of 6
     shifted_median = ema_basis.shift(offset)
     
     curr_close = df['close'].iloc[-1]
@@ -90,16 +91,11 @@ def get_bb_median_status(df, period=20, offset=6):
     curr_med = shifted_median.iloc[-1]
     prev_med = shifted_median.iloc[-2]
     
-    # Logic: 1H Median Cross
     if prev_close < prev_med and curr_close > curr_med:
         return "🚀 CROSS"
-    # Logic: 1H Pullback Support
     elif curr_low <= curr_med and curr_close > curr_med:
         return "🛡️ SUPPORT"
-    elif curr_close > curr_med:
-        return "Above"
-    else:
-        return "Below"
+    return "Above" if curr_close > curr_med else "Below"
 
 @st.cache_data(ttl="1d")
 def get_daily_avg_vol(_kite, symbols):
@@ -130,11 +126,14 @@ with st.sidebar:
     tg_toggle = st.toggle("Enable Telegram Mode", value=True)
     if tg_toggle:
         if TG_TOKEN and TG_ID:
-            st.success("✅ Telegram Linked")
+            st.success("✅ Secrets Configured")
             if st.button("🔔 Send Test Message"):
-                if send_telegram_msg(TG_TOKEN, TG_ID, "<b>Scanner Test</b>: Link Working! 🚀"):
-                    st.toast("Check Telegram!")
-                else: st.error("Failed. Try typing /start to your bot.")
+                # Force a fresh message to check link
+                test_msg = f"<b>Scanner Check</b>\nTime: {now_ist.strftime('%H:%M:%S')}\nStatus: Connected 🚀"
+                if send_telegram_msg(TG_TOKEN, TG_ID, test_msg):
+                    st.toast("Success! Check Telegram.")
+                else: 
+                    st.error("Failed. Ensure you have clicked 'START' in your Bot chat.")
         else:
             st.warning("⚠️ Secrets Missing.")
     
@@ -178,14 +177,12 @@ if 'access_token' in st.session_state:
         except: continue
     
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
-    
     if not symbols:
         st.warning("No symbols found in Google Sheets.")
         st.stop()
 
     avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
     results = []
-    
     progress = st.empty()
     progress.info(f"Scanning {len(symbols)} Stocks...")
 
@@ -193,7 +190,7 @@ if 'access_token' in st.session_state:
         full_quotes = st.session_state.kite.quote(symbols)
     except:
         if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
-        st.error("Session Expired. Please Login again.")
+        st.error("Session Expired.")
         st.stop()
 
     for s in symbols:
@@ -202,22 +199,17 @@ if 'access_token' in st.session_state:
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
             
-            # --- BB MEDIAN & EMA LOGIC ---
-            # Fetch 1H data for BB Median (offset 6 needs enough historical bars)
+            # 1. Volume Logic
+            is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
+            
+            # 2. Indicators (1H and 15m)
             hist_1h = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "60minute")
             df_1h = pd.DataFrame(hist_1h)
+            bb_status = get_bb_median_status(df_1h, period=20, offset=6) if len(df_1h) >= 30 else "N/A"
             
-            # Fetch 15m data for existing EMA cross logic
             hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
             df_15m = pd.DataFrame(hist_15m)
-
-            bb_status = "Waiting..."
             is_ema_cross = False
-            is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
-
-            if len(df_1h) >= 30:
-                bb_status = get_bb_median_status(df_1h, period=20, offset=6)
-            
             if len(df_15m) >= 55:
                 ema20 = calculate_ema(df_15m['close'], 20).iloc[-1]
                 ema50 = calculate_ema(df_15m['close'], 50).iloc[-1]
@@ -227,13 +219,23 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # Trigger Logic for BB Median alerts
-            if "🚀" in bb_status and f"{sym_short}|BB Median" not in alerted_keys:
-                trigger_alert(sym_short, "BB Median 1H", ltp)
+            # 3. Alert Trigger Logic
+            triggered = False
+            alert_type = ""
+            
+            if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
+                alert_type = "Volume Breakout"
+                triggered = True
+            elif "🚀" in bb_status and f"{sym_short}|BB Median" not in alerted_keys:
+                alert_type = "BB Median 1H"
+                triggered = True
+            
+            if triggered:
+                trigger_alert(sym_short, alert_type, ltp)
                 if tg_toggle and TG_TOKEN and TG_ID:
-                    tg_msg = f"🚀 <b>BB MEDIAN CROSS (1H)</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
+                    tg_msg = f"🚀 <b>{alert_type} ALERT</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
                     send_telegram_msg(TG_TOKEN, TG_ID, tg_msg)
-                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": "BB Median", "Time": now_ist.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
+                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now_ist.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
             results.append({
                 "Symbol": sym_short, "LTP": ltp, "Change %": pct, 
@@ -246,7 +248,9 @@ if 'access_token' in st.session_state:
 
     progress.empty()
     
-    t_main, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
+    # --- 7. TABS & DISPLAY ---
+    t_main, t_vol, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
+    
     col_config = {
         "Symbol": st.column_config.TextColumn("Symbol"),
         "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
@@ -260,6 +264,7 @@ if 'access_token' in st.session_state:
     if results:
         df_res = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
         with t_main: st.dataframe(df_res, use_container_width=True, hide_index=True, column_config=col_config)
+        with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
         with t_bb: st.dataframe(df_res[df_res['BB Median (1H)'].str.contains("🚀|🛡️", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
         with t_ema: st.dataframe(df_res[df_res['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
     
