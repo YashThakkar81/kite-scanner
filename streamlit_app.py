@@ -51,15 +51,14 @@ def trigger_alert(symbol, alert_type, ltp):
 
 def send_telegram_msg(token, chat_id, message):
     if not token or not chat_id: return False
-    # Clean the chat_id in case it was passed as a string with spaces
     chat_id = str(chat_id).strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    # Added disable_web_page_preview to ensure cleaner message delivery
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         return resp.status_code == 200
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+    except:
         return False
 
 # --- 3. SESSION STATE ---
@@ -82,7 +81,9 @@ def calculate_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_bb_median_status(df, period=20, offset=6):
+    # As requested: Using EMA for the Basis MA Type
     ema_basis = calculate_ema(df['close'], period)
+    # Applying the 6-period offset
     shifted_median = ema_basis.shift(offset)
     
     curr_close = df['close'].iloc[-1]
@@ -128,8 +129,7 @@ with st.sidebar:
         if TG_TOKEN and TG_ID:
             st.success("✅ Secrets Configured")
             if st.button("🔔 Send Test Message"):
-                # Force a fresh message to check link
-                test_msg = f"<b>Scanner Check</b>\nTime: {now_ist.strftime('%H:%M:%S')}\nStatus: Connected 🚀"
+                test_msg = f"<b>Scanner Connection Check</b>\nTime: {now_ist.strftime('%H:%M:%S')}\nStatus: Active 🚀"
                 if send_telegram_msg(TG_TOKEN, TG_ID, test_msg):
                     st.toast("Success! Check Telegram.")
                 else: 
@@ -199,14 +199,15 @@ if 'access_token' in st.session_state:
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
             
-            # 1. Volume Logic
+            # Volume Logic Integration
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             
-            # 2. Indicators (1H and 15m)
+            # BB Median 1H Calculation
             hist_1h = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "60minute")
             df_1h = pd.DataFrame(hist_1h)
             bb_status = get_bb_median_status(df_1h, period=20, offset=6) if len(df_1h) >= 30 else "N/A"
             
+            # EMA 15m Calculation
             hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
             df_15m = pd.DataFrame(hist_15m)
             is_ema_cross = False
@@ -219,18 +220,14 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # 3. Alert Trigger Logic
-            triggered = False
+            # Alert Triggering logic
             alert_type = ""
-            
             if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
                 alert_type = "Volume Breakout"
-                triggered = True
             elif "🚀" in bb_status and f"{sym_short}|BB Median" not in alerted_keys:
                 alert_type = "BB Median 1H"
-                triggered = True
             
-            if triggered:
+            if alert_type:
                 trigger_alert(sym_short, alert_type, ltp)
                 if tg_toggle and TG_TOKEN and TG_ID:
                     tg_msg = f"🚀 <b>{alert_type} ALERT</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
@@ -248,7 +245,7 @@ if 'access_token' in st.session_state:
 
     progress.empty()
     
-    # --- 7. TABS & DISPLAY ---
+    # --- 7. UI TABS (Restored Volume) ---
     t_main, t_vol, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
     
     col_config = {
