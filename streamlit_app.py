@@ -51,7 +51,6 @@ def trigger_alert(symbol, alert_type, ltp):
 
 def send_telegram_msg(token, chat_id, message):
     if not token or not chat_id: return False
-    # Clean the chat_id in case it was passed as a string with spaces
     chat_id = str(chat_id).strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False}
@@ -59,7 +58,6 @@ def send_telegram_msg(token, chat_id, message):
         resp = requests.post(url, json=payload, timeout=10)
         return resp.status_code == 200
     except Exception as e:
-        print(f"Telegram Error: {e}")
         return False
 
 # --- 3. SESSION STATE ---
@@ -89,9 +87,8 @@ def get_bb_median_status(df, period=20, offset=6):
     prev_close = df['close'].iloc[-2]
     curr_low = df['low'].iloc[-1]
     curr_med = shifted_median.iloc[-1]
-    prev_med = shifted_median.iloc[-2]
     
-    if prev_close < prev_med and curr_close > curr_med:
+    if prev_close < shifted_median.iloc[-2] and curr_close > curr_med:
         return "🚀 CROSS"
     elif curr_low <= curr_med and curr_close > curr_med:
         return "🛡️ SUPPORT"
@@ -128,12 +125,11 @@ with st.sidebar:
         if TG_TOKEN and TG_ID:
             st.success("✅ Secrets Configured")
             if st.button("🔔 Send Test Message"):
-                # Force a fresh message to check link
                 test_msg = f"<b>Scanner Check</b>\nTime: {now_ist.strftime('%H:%M:%S')}\nStatus: Connected 🚀"
                 if send_telegram_msg(TG_TOKEN, TG_ID, test_msg):
                     st.toast("Success! Check Telegram.")
                 else: 
-                    st.error("Failed. Ensure you have clicked 'START' in your Bot chat.")
+                    st.error("Failed. Ensure Bot is started.")
         else:
             st.warning("⚠️ Secrets Missing.")
     
@@ -152,9 +148,6 @@ with st.sidebar:
             except Exception as e: st.error(f"Error: {e}")
     else:
         st.success("✅ Kite Connected")
-        with st.expander("🛠️ Developer: View Access Token"):
-            st.code(st.session_state.access_token, language="text")
-            
         if st.button("Logout / Reset", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear(); st.rerun()
@@ -198,11 +191,8 @@ if 'access_token' in st.session_state:
             q = full_quotes[s]
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
-            
-            # 1. Volume Logic
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             
-            # 2. Indicators (1H and 15m)
             hist_1h = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "60minute")
             df_1h = pd.DataFrame(hist_1h)
             bb_status = get_bb_median_status(df_1h, period=20, offset=6) if len(df_1h) >= 30 else "N/A"
@@ -219,16 +209,12 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # 3. Alert Trigger Logic
             triggered = False
             alert_type = ""
-            
             if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
-                alert_type = "Volume Breakout"
-                triggered = True
+                alert_type = "Volume Breakout"; triggered = True
             elif "🚀" in bb_status and f"{sym_short}|BB Median" not in alerted_keys:
-                alert_type = "BB Median 1H"
-                triggered = True
+                alert_type = "BB Median 1H"; triggered = True
             
             if triggered:
                 trigger_alert(sym_short, alert_type, ltp)
@@ -237,13 +223,7 @@ if 'access_token' in st.session_state:
                     send_telegram_msg(TG_TOKEN, TG_ID, tg_msg)
                 st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now_ist.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
-            results.append({
-                "Symbol": sym_short, "LTP": ltp, "Change %": pct, 
-                "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal",
-                "EMA Status": "⚡ CROSS" if is_ema_cross else "Below",
-                "BB Median (1H)": bb_status,
-                "Chart": tv_url
-            })
+            results.append({"Symbol": sym_short, "LTP": ltp, "Change %": pct, "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal", "EMA Status": "⚡ CROSS" if is_ema_cross else "Below", "BB Median (1H)": bb_status, "Chart": tv_url})
         except: continue
 
     progress.empty()
@@ -251,6 +231,7 @@ if 'access_token' in st.session_state:
     # --- 7. TABS & DISPLAY ---
     t_main, t_vol, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
     
+    # Common column config for ALL tabs (including History)
     col_config = {
         "Symbol": st.column_config.TextColumn("Symbol"),
         "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
@@ -270,7 +251,9 @@ if 'access_token' in st.session_state:
     
     with t_log: 
         if st.session_state.alerts_history:
-            st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True)
+            # FIX: Convert alert history to DataFrame and apply column_config to enable links
+            df_history = pd.DataFrame(st.session_state.alerts_history).iloc[::-1]
+            st.dataframe(df_history, use_container_width=True, hide_index=True, column_config=col_config)
 
     time.sleep(60)
     st.rerun()
