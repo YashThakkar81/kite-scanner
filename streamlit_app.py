@@ -52,7 +52,7 @@ def trigger_alert(symbol, alert_type, ltp):
 def send_telegram_msg(token, chat_id, message):
     if not token or not chat_id: return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False}
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload, timeout=8)
         return resp.status_code == 200
@@ -65,12 +65,13 @@ if 'alerts_history' not in st.session_state:
     st.session_state.alerts_history = [] 
 
 TOKEN_FILE = "access_token.txt"
+# Auto-load token if it exists from earlier today
 if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
     try:
         with open(TOKEN_FILE, "r") as f:
-            token = f.read().strip()
-            st.session_state.access_token = token
-            st.session_state.kite.set_access_token(token)
+            saved_token = f.read().strip()
+            st.session_state.kite.set_access_token(saved_token)
+            st.session_state.access_token = saved_token
     except: pass
 
 # --- 4. UTILS ---
@@ -97,11 +98,6 @@ with st.sidebar:
     now_ist = datetime.now(IST)
     st.info(f"Last Updated: {now_ist.strftime('%H:%M:%S')}")
     
-    # Market Status Indicator
-    is_weekend = now_ist.weekday() >= 5
-    if is_weekend:
-        st.warning("Market is Closed (Weekend)")
-    
     if st.button("🔔 Enable Desktop Alerts"):
         components.html("<script>Notification.requestPermission();</script>", height=0)
         st.success("Permission Requested!")
@@ -113,9 +109,9 @@ with st.sidebar:
         if TG_TOKEN and TG_ID:
             st.success("✅ Telegram Linked")
             if st.button("🔔 Send Test Message"):
-                success = send_telegram_msg(TG_TOKEN, TG_ID, "<b>Scanner Test</b>: Connection working! 🚀")
-                if success: st.toast("Sent! Check Telegram.")
-                else: st.error("Failed. Check Chat ID/Bot Start.")
+                if send_telegram_msg(TG_TOKEN, TG_ID, "<b>Scanner Test</b>: Link Working! 🚀"):
+                    st.toast("Check Telegram!")
+                else: st.error("Failed. Try typing /start to your bot.")
         else:
             st.warning("⚠️ Secrets Missing.")
     
@@ -134,6 +130,11 @@ with st.sidebar:
             except Exception as e: st.error(f"Error: {e}")
     else:
         st.success("✅ Kite Connected")
+        # --- NEW: COPY ACCESS TOKEN SECTION ---
+        with st.expander("🛠️ Developer: View Access Token"):
+            st.code(st.session_state.access_token, language="text")
+            st.caption("Copy this to your Google Sheet if needed.")
+            
         if st.button("Logout / Reset", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear(); st.rerun()
@@ -170,7 +171,9 @@ if 'access_token' in st.session_state:
     try:
         full_quotes = st.session_state.kite.quote(symbols)
     except:
-        st.error("Session Expired.")
+        # If token expired overnight, remove file and force re-login
+        if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
+        st.error("Session Expired. Please Login again.")
         st.stop()
 
     for s in symbols:
@@ -182,7 +185,6 @@ if 'access_token' in st.session_state:
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             is_ema_cross = False
             
-            # EMA Logic triggered only on movement
             if is_vol_break or pct > 0.5: 
                 hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
                 df_15m = pd.DataFrame(hist_15m)
