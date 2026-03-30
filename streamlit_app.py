@@ -60,7 +60,7 @@ def send_telegram_msg(token, chat_id, message):
     except Exception as e:
         return False
 
-# --- 3. SESSION STATE & TOKEN PERSISTENCE ---
+# --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
     st.session_state.kite = KiteConnect(api_key=API_KEY)
 if 'alerts_history' not in st.session_state:
@@ -113,14 +113,14 @@ with st.sidebar:
     now_ist = datetime.now(IST)
     st.info(f"Last Updated: {now_ist.strftime('%H:%M:%S')}")
     
-    # NEW: Dedicated Access Token Display Section (Always Visible if logged in)
+    # ALWAYS VISIBLE ACCESS TOKEN BLOCK
     if 'access_token' in st.session_state:
         st.divider()
         st.header("🔑 Session Token")
         st.success("Kite Connected ✅")
         st.code(st.session_state.access_token, language="text")
-        st.caption("Copy the code above for your Pine Script / TradingView bridge.")
-    
+        st.caption("Copy for Pine Script Alerts")
+
     st.divider()
     if st.button("🔔 Enable Desktop Alerts"):
         components.html("<script>Notification.requestPermission();</script>", height=0)
@@ -144,9 +144,11 @@ with st.sidebar:
                 st.rerun()
             except Exception as e: st.error(f"Error: {e}")
     else:
-        if st.button("Logout / Reset Session", color="red", use_container_width=True):
+        # FIXED: Removed 'color' argument to prevent TypeError
+        if st.button("Logout / Reset Session", type="primary", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
-            st.session_state.clear(); st.rerun()
+            st.session_state.clear()
+            st.rerun()
     
     st.divider()
     if st.button("🗑️ Clear History", use_container_width=True):
@@ -167,7 +169,7 @@ if 'access_token' in st.session_state:
     
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
     if not symbols:
-        st.warning("No symbols found in Sheets.")
+        st.warning("No symbols found in Google Sheets.")
         st.stop()
 
     avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
@@ -218,7 +220,15 @@ if 'access_token' in st.session_state:
 
     # --- 7. TABS & DISPLAY ---
     t_main, t_vol, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
-    col_config = {"Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")}
+    col_config = {
+        "Symbol": st.column_config.TextColumn("Symbol"),
+        "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
+        "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
+        "Vol Status": st.column_config.TextColumn("Vol Status"),
+        "EMA Status": st.column_config.TextColumn("EMA Status"),
+        "BB Median (1H)": st.column_config.TextColumn("BB Median (1H)"),
+        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
+    }
 
     if results:
         df_res = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
