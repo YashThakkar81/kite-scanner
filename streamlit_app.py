@@ -60,7 +60,7 @@ def send_telegram_msg(token, chat_id, message):
     except Exception as e:
         return False
 
-# --- 3. SESSION STATE ---
+# --- 3. SESSION STATE & TOKEN PERSISTENCE ---
 if 'kite' not in st.session_state:
     st.session_state.kite = KiteConnect(api_key=API_KEY)
 if 'alerts_history' not in st.session_state:
@@ -82,7 +82,6 @@ def calculate_ema(series, period):
 def get_bb_median_status(df, period=20, offset=6):
     ema_basis = calculate_ema(df['close'], period)
     shifted_median = ema_basis.shift(offset)
-    
     curr_close = df['close'].iloc[-1]
     prev_close = df['close'].iloc[-2]
     curr_low = df['low'].iloc[-1]
@@ -114,24 +113,22 @@ with st.sidebar:
     now_ist = datetime.now(IST)
     st.info(f"Last Updated: {now_ist.strftime('%H:%M:%S')}")
     
+    # NEW: Dedicated Access Token Display Section (Always Visible if logged in)
+    if 'access_token' in st.session_state:
+        st.divider()
+        st.header("🔑 Session Token")
+        st.success("Kite Connected ✅")
+        st.code(st.session_state.access_token, language="text")
+        st.caption("Copy the code above for your Pine Script / TradingView bridge.")
+    
+    st.divider()
     if st.button("🔔 Enable Desktop Alerts"):
         components.html("<script>Notification.requestPermission();</script>", height=0)
         st.success("Permission Requested!")
 
     st.divider()
-    st.header("📲 Telegram Alerts")
-    tg_toggle = st.toggle("Enable Telegram Mode", value=True)
-    if tg_toggle:
-        if TG_TOKEN and TG_ID:
-            st.success("✅ Secrets Configured")
-            if st.button("🔔 Send Test Message"):
-                test_msg = f"<b>Scanner Check</b>\nTime: {now_ist.strftime('%H:%M:%S')}\nStatus: Connected 🚀"
-                if send_telegram_msg(TG_TOKEN, TG_ID, test_msg):
-                    st.toast("Success! Check Telegram.")
-                else: 
-                    st.error("Failed. Ensure Bot is started.")
-        else:
-            st.warning("⚠️ Secrets Missing.")
+    st.header("📲 Telegram Mode")
+    tg_toggle = st.toggle("Enable Alerts", value=True)
     
     st.divider()
     if 'access_token' not in st.session_state:
@@ -147,13 +144,12 @@ with st.sidebar:
                 st.rerun()
             except Exception as e: st.error(f"Error: {e}")
     else:
-        st.success("✅ Kite Connected")
-        if st.button("Logout / Reset", use_container_width=True):
+        if st.button("Logout / Reset Session", color="red", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear(); st.rerun()
     
     st.divider()
-    if st.button("🗑️ Clear Alert History", use_container_width=True):
+    if st.button("🗑️ Clear History", use_container_width=True):
         st.session_state.alerts_history = []
         st.rerun()
 
@@ -171,13 +167,12 @@ if 'access_token' in st.session_state:
     
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
     if not symbols:
-        st.warning("No symbols found in Google Sheets.")
+        st.warning("No symbols found in Sheets.")
         st.stop()
 
     avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
     results = []
     progress = st.empty()
-    progress.info(f"Scanning {len(symbols)} Stocks...")
 
     try:
         full_quotes = st.session_state.kite.quote(symbols)
@@ -194,16 +189,11 @@ if 'access_token' in st.session_state:
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             
             hist_1h = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "60minute")
-            df_1h = pd.DataFrame(hist_1h)
-            bb_status = get_bb_median_status(df_1h, period=20, offset=6) if len(df_1h) >= 30 else "N/A"
+            bb_status = get_bb_median_status(pd.DataFrame(hist_1h), period=20, offset=6) if len(hist_1h) >= 30 else "N/A"
             
             hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
             df_15m = pd.DataFrame(hist_15m)
-            is_ema_cross = False
-            if len(df_15m) >= 55:
-                ema20 = calculate_ema(df_15m['close'], 20).iloc[-1]
-                ema50 = calculate_ema(df_15m['close'], 50).iloc[-1]
-                is_ema_cross = ema20 > ema50
+            is_ema_cross = calculate_ema(df_15m['close'], 20).iloc[-1] > calculate_ema(df_15m['close'], 50).iloc[-1] if len(df_15m) >= 55 else False
 
             sym_short = s.replace("NSE:", "")
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
@@ -226,21 +216,9 @@ if 'access_token' in st.session_state:
             results.append({"Symbol": sym_short, "LTP": ltp, "Change %": pct, "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal", "EMA Status": "⚡ CROSS" if is_ema_cross else "Below", "BB Median (1H)": bb_status, "Chart": tv_url})
         except: continue
 
-    progress.empty()
-    
     # --- 7. TABS & DISPLAY ---
     t_main, t_vol, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
-    
-    # Common column config for ALL tabs (including History)
-    col_config = {
-        "Symbol": st.column_config.TextColumn("Symbol"),
-        "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-        "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
-        "Vol Status": st.column_config.TextColumn("Vol Status"),
-        "EMA Status": st.column_config.TextColumn("EMA Status"),
-        "BB Median (1H)": st.column_config.TextColumn("BB Median (1H)"),
-        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
-    }
+    col_config = {"Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")}
 
     if results:
         df_res = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
@@ -251,9 +229,7 @@ if 'access_token' in st.session_state:
     
     with t_log: 
         if st.session_state.alerts_history:
-            # FIX: Convert alert history to DataFrame and apply column_config to enable links
-            df_history = pd.DataFrame(st.session_state.alerts_history).iloc[::-1]
-            st.dataframe(df_history, use_container_width=True, hide_index=True, column_config=col_config)
+            st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
 
     time.sleep(60)
     st.rerun()
