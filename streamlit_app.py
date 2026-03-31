@@ -73,27 +73,37 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
             st.session_state.access_token = saved_token
     except: pass
 
-# --- 4. INDICATOR CALCS (ALIGNED WITH TRADINGVIEW) ---
+# --- 4. INDICATOR CALCS (ALIGNED WITH TRADINGVIEW IMAGE SETTINGS) ---
 def calculate_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def calculate_sma(series, period):
     return series.rolling(window=period).mean()
 
-def get_bb_median_status(df, period=20):
-    # TradingView BB Basis is an SMA
-    bb_median = calculate_sma(df['close'], period)
+def get_bb_median_status(df, period=20, offset=6):
+    # TradingView BB Basis is an SMA (20) with an Offset (6)
+    sma_basis = calculate_sma(df['close'], period)
+    # Applying the Offset: Shifts the data forward as seen on your chart
+    bb_median = sma_basis.shift(offset)
     
     curr_close = df['close'].iloc[-1]
     prev_close = df['close'].iloc[-2]
     curr_low   = df['low'].iloc[-1]
+    
+    # Check if there is enough data for the shifted median
+    if len(bb_median) < 2 or pd.isna(bb_median.iloc[-1]):
+        return "N/A"
+        
     curr_med   = bb_median.iloc[-1]
     prev_med   = bb_median.iloc[-2]
     
+    # Logic: CROSS (Price cuts through the shifted median)
     if prev_close < prev_med and curr_close > curr_med:
         return "🚀 CROSS"
+    # Logic: SUPPORT (Low hits median but stays above)
     elif curr_low <= curr_med and curr_close > curr_med:
         return "🛡️ SUPPORT"
+        
     return "Above" if curr_close > curr_med else "Below"
 
 @st.cache_data(ttl="1d")
@@ -120,11 +130,6 @@ with st.sidebar:
         st.divider()
         st.success("Kite Connected ✅")
         st.code(st.session_state.access_token, language="text")
-        st.caption("Copy for Pine Script Alerts")
-
-    st.divider()
-    if st.button("🔔 Enable Desktop Alerts"):
-        components.html("<script>Notification.requestPermission();</script>", height=0)
 
     st.header("📲 Telegram Mode")
     tg_toggle = st.toggle("Enable Alerts", value=True)
@@ -181,7 +186,8 @@ if 'access_token' in st.session_state:
             
             # Historical Data for Indicators
             hist_1h = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "60minute")
-            bb_status = get_bb_median_status(pd.DataFrame(hist_1h)) if len(hist_1h) >= 20 else "N/A"
+            # period=20, offset=6 as per your TradingView screenshot
+            bb_status = get_bb_median_status(pd.DataFrame(hist_1h), period=20, offset=6) if len(hist_1h) >= 30 else "N/A"
             
             hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
             df_15m = pd.DataFrame(hist_15m)
@@ -191,7 +197,7 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # Alert Logic
+            # Alert Trigger Logic
             alert_type = ""
             if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
                 alert_type = "Volume Breakout"
