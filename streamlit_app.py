@@ -51,14 +51,12 @@ def trigger_alert(symbol, alert_type, ltp):
 
 def send_telegram_msg(token, chat_id, message):
     if not token or not chat_id: return False
-    chat_id = str(chat_id).strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False}
+    payload = {"chat_id": str(chat_id).strip(), "text": message, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         return resp.status_code == 200
-    except Exception as e:
-        return False
+    except: return False
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
@@ -75,19 +73,24 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
             st.session_state.access_token = saved_token
     except: pass
 
-# --- 4. INDICATOR CALCS ---
+# --- 4. INDICATOR CALCS (ALIGNED WITH TRADINGVIEW) ---
 def calculate_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def get_bb_median_status(df, period=20, offset=6):
-    ema_basis = calculate_ema(df['close'], period)
-    shifted_median = ema_basis.shift(offset)
+def calculate_sma(series, period):
+    return series.rolling(window=period).mean()
+
+def get_bb_median_status(df, period=20):
+    # TradingView BB Basis is an SMA
+    bb_median = calculate_sma(df['close'], period)
+    
     curr_close = df['close'].iloc[-1]
     prev_close = df['close'].iloc[-2]
-    curr_low = df['low'].iloc[-1]
-    curr_med = shifted_median.iloc[-1]
+    curr_low   = df['low'].iloc[-1]
+    curr_med   = bb_median.iloc[-1]
+    prev_med   = bb_median.iloc[-2]
     
-    if prev_close < shifted_median.iloc[-2] and curr_close > curr_med:
+    if prev_close < prev_med and curr_close > curr_med:
         return "🚀 CROSS"
     elif curr_low <= curr_med and curr_close > curr_med:
         return "🛡️ SUPPORT"
@@ -103,7 +106,7 @@ def get_daily_avg_vol(_kite, symbols):
             q = _kite.quote(s)[s]
             hist = _kite.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
             avg_vol_map[s] = sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
-            time.sleep(0.05) 
+            time.sleep(0.02) 
         except: avg_vol_map[s] = 999999999
     return avg_vol_map
 
@@ -113,10 +116,8 @@ with st.sidebar:
     now_ist = datetime.now(IST)
     st.info(f"Last Updated: {now_ist.strftime('%H:%M:%S')}")
     
-    # ALWAYS VISIBLE ACCESS TOKEN BLOCK
     if 'access_token' in st.session_state:
         st.divider()
-        st.header("🔑 Session Token")
         st.success("Kite Connected ✅")
         st.code(st.session_state.access_token, language="text")
         st.caption("Copy for Pine Script Alerts")
@@ -124,13 +125,10 @@ with st.sidebar:
     st.divider()
     if st.button("🔔 Enable Desktop Alerts"):
         components.html("<script>Notification.requestPermission();</script>", height=0)
-        st.success("Permission Requested!")
 
-    st.divider()
     st.header("📲 Telegram Mode")
     tg_toggle = st.toggle("Enable Alerts", value=True)
     
-    st.divider()
     if 'access_token' not in st.session_state:
         st.link_button("1. Get Login URL", st.session_state.kite.login_url(), use_container_width=True)
         token_in = st.text_input("2. Enter Request Token")
@@ -144,16 +142,10 @@ with st.sidebar:
                 st.rerun()
             except Exception as e: st.error(f"Error: {e}")
     else:
-        # FIXED: Removed 'color' argument to prevent TypeError
         if st.button("Logout / Reset Session", type="primary", use_container_width=True):
             if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
             st.session_state.clear()
             st.rerun()
-    
-    st.divider()
-    if st.button("🗑️ Clear History", use_container_width=True):
-        st.session_state.alerts_history = []
-        st.rerun()
 
 # --- 6. DATA PROCESSING ---
 if 'access_token' in st.session_state:
@@ -163,23 +155,20 @@ if 'access_token' in st.session_state:
         try:
             df_sheet = conn.read(worksheet=ws)
             if not df_sheet.empty:
-                data = df_sheet.iloc[:, 0].dropna().astype(str).tolist()
-                all_syms.extend(data)
+                all_syms.extend(df_sheet.iloc[:, 0].dropna().astype(str).tolist())
         except: continue
     
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
     if not symbols:
-        st.warning("No symbols found in Google Sheets.")
+        st.warning("No symbols found.")
         st.stop()
 
     avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
     results = []
-    progress = st.empty()
 
     try:
         full_quotes = st.session_state.kite.quote(symbols)
     except:
-        if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
         st.error("Session Expired.")
         st.stop()
 
@@ -190,29 +179,29 @@ if 'access_token' in st.session_state:
             pct = round(((ltp - cl) / cl) * 100, 2)
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             
+            # Historical Data for Indicators
             hist_1h = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "60minute")
-            bb_status = get_bb_median_status(pd.DataFrame(hist_1h), period=20, offset=6) if len(hist_1h) >= 30 else "N/A"
+            bb_status = get_bb_median_status(pd.DataFrame(hist_1h)) if len(hist_1h) >= 20 else "N/A"
             
             hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
             df_15m = pd.DataFrame(hist_15m)
-            is_ema_cross = calculate_ema(df_15m['close'], 20).iloc[-1] > calculate_ema(df_15m['close'], 50).iloc[-1] if len(df_15m) >= 55 else False
+            is_ema_cross = calculate_ema(df_15m['close'], 20).iloc[-1] > calculate_ema(df_15m['close'], 50).iloc[-1] if len(df_15m) >= 50 else False
 
             sym_short = s.replace("NSE:", "")
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            triggered = False
+            # Alert Logic
             alert_type = ""
             if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
-                alert_type = "Volume Breakout"; triggered = True
+                alert_type = "Volume Breakout"
             elif "🚀" in bb_status and f"{sym_short}|BB Median" not in alerted_keys:
-                alert_type = "BB Median 1H"; triggered = True
+                alert_type = "BB Median 1H"
             
-            if triggered:
+            if alert_type:
                 trigger_alert(sym_short, alert_type, ltp)
                 if tg_toggle and TG_TOKEN and TG_ID:
-                    tg_msg = f"🚀 <b>{alert_type} ALERT</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>View Chart 📈</a>"
-                    send_telegram_msg(TG_TOKEN, TG_ID, tg_msg)
+                    send_telegram_msg(TG_TOKEN, TG_ID, f"🚀 <b>{alert_type}</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>Chart 📈</a>")
                 st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now_ist.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
 
             results.append({"Symbol": sym_short, "LTP": ltp, "Change %": pct, "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal", "EMA Status": "⚡ CROSS" if is_ema_cross else "Below", "BB Median (1H)": bb_status, "Chart": tv_url})
@@ -221,12 +210,8 @@ if 'access_token' in st.session_state:
     # --- 7. TABS & DISPLAY ---
     t_main, t_vol, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
     col_config = {
-        "Symbol": st.column_config.TextColumn("Symbol"),
         "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
         "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
-        "Vol Status": st.column_config.TextColumn("Vol Status"),
-        "EMA Status": st.column_config.TextColumn("EMA Status"),
-        "BB Median (1H)": st.column_config.TextColumn("BB Median (1H)"),
         "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
     }
 
