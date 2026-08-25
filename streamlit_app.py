@@ -6,8 +6,7 @@ import streamlit.components.v1 as components
 import time
 import os
 import pytz 
-import requests 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
@@ -25,14 +24,12 @@ st.markdown("""
 try:
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
-    TG_TOKEN = st.secrets.get("TELEGRAM_TOKEN")
-    TG_ID = st.secrets.get("TELEGRAM_CHAT_ID")
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
     st.error(f"Setup Error: {e}")
     st.stop()
 
-# --- 2. NOTIFICATION ENGINE ---
+# --- 2. PC NOTIFICATION ENGINE ---
 def trigger_alert(symbol, alert_type, ltp):
     notification_js = f"""
     <script>
@@ -49,15 +46,6 @@ def trigger_alert(symbol, alert_type, ltp):
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
 
-def send_telegram_msg(token, chat_id, message):
-    if not token or not chat_id: return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": str(chat_id).strip(), "text": message, "parse_mode": "HTML"}
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        return resp.status_code == 200
-    except: return False
-
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
     st.session_state.kite = KiteConnect(api_key=API_KEY)
@@ -73,38 +61,24 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
             st.session_state.access_token = saved_token
     except: pass
 
-# --- 4. INDICATOR CALCS (ALIGNED WITH TRADINGVIEW IMAGE SETTINGS) ---
-def calculate_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+# --- 4. DONCHIAN CHANNEL (15m TF, LENGTH 28, OFFSET 6) ---
+def get_donchian_status(df, length=28, offset=6):
+    if len(df) < (length + offset):
+        return "N/A", False
 
-def calculate_sma(series, period):
-    return series.rolling(window=period).mean()
-
-def get_bb_median_status(df, period=20, offset=6):
-    # TradingView BB Basis is an SMA (20) with an Offset (6)
-    sma_basis = calculate_sma(df['close'], period)
-    # Applying the Offset: Shifts the data forward as seen on your chart
-    bb_median = sma_basis.shift(offset)
+    # Upper channel calculation: 28-period max shifted forward by offset 6
+    upper_channel = df['high'].rolling(window=length).max().shift(offset)
     
     curr_close = df['close'].iloc[-1]
-    prev_close = df['close'].iloc[-2]
-    curr_low   = df['low'].iloc[-1]
+    curr_upper = upper_channel.iloc[-1]
+
+    if pd.isna(curr_upper):
+        return "N/A", False
+
+    is_breakout = curr_close >= curr_upper
+    status_str = "🚀 UPPER BREAKOUT" if is_breakout else "Below"
     
-    # Check if there is enough data for the shifted median
-    if len(bb_median) < 2 or pd.isna(bb_median.iloc[-1]):
-        return "N/A"
-        
-    curr_med   = bb_median.iloc[-1]
-    prev_med   = bb_median.iloc[-2]
-    
-    # Logic: CROSS (Price cuts through the shifted median)
-    if prev_close < prev_med and curr_close > curr_med:
-        return "🚀 CROSS"
-    # Logic: SUPPORT (Low hits median but stays above)
-    elif curr_low <= curr_med and curr_close > curr_med:
-        return "🛡️ SUPPORT"
-        
-    return "Above" if curr_close > curr_med else "Below"
+    return status_str, is_breakout
 
 @st.cache_data(ttl="1d")
 def get_daily_avg_vol(_kite, symbols):
@@ -120,20 +94,32 @@ def get_daily_avg_vol(_kite, symbols):
         except: avg_vol_map[s] = 999999999
     return avg_vol_map
 
-# --- 5. SIDEBAR ---
+# --- 5. MARKET HOURS UTILITY ---
+def is_market_open():
+    now = datetime.now(IST)
+    if now.weekday() >= 5: # Saturday or Sunday
+        return False
+    market_start = dtime(9, 7)
+    market_end = dtime(15, 30)
+    return market_start <= now.time() <= market_end
+
+# --- 6. SIDEBAR (AUTHENTICATION & STATUS) ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
     now_ist = datetime.now(IST)
     st.info(f"Last Updated: {now_ist.strftime('%H:%M:%S')}")
     
+    market_active = is_market_open()
+    if market_active:
+        st.success("Market Status: OPEN (Live Refresh Active) 🟢")
+    else:
+        st.warning("Market Status: CLOSED (Manual Mode / Backtest) 🔴")
+
     if 'access_token' in st.session_state:
         st.divider()
         st.success("Kite Connected ✅")
         st.code(st.session_state.access_token, language="text")
 
-    st.header("📲 Telegram Mode")
-    tg_toggle = st.toggle("Enable Alerts", value=True)
-    
     if 'access_token' not in st.session_state:
         st.link_button("1. Get Login URL", st.session_state.kite.login_url(), use_container_width=True)
         token_in = st.text_input("2. Enter Request Token")
@@ -152,10 +138,11 @@ with st.sidebar:
             st.session_state.clear()
             st.rerun()
 
-# --- 6. DATA PROCESSING ---
+# --- 7. MAIN DATA PROCESSING & EXECUTION ---
 if 'access_token' in st.session_state:
     sheets = ["Scanner_Output 1", "Scanner_Output 2", "Scanner_Output 3"]
     all_syms = []
+    
     for ws in sheets:
         try:
             df_sheet = conn.read(worksheet=ws)
@@ -165,7 +152,7 @@ if 'access_token' in st.session_state:
     
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
     if not symbols:
-        st.warning("No symbols found.")
+        st.warning("No symbols found in Google Sheet.")
         st.stop()
 
     avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
@@ -174,7 +161,7 @@ if 'access_token' in st.session_state:
     try:
         full_quotes = st.session_state.kite.quote(symbols)
     except:
-        st.error("Session Expired.")
+        st.error("Kite Session Expired. Please re-login via sidebar.")
         st.stop()
 
     for s in symbols:
@@ -184,37 +171,47 @@ if 'access_token' in st.session_state:
             pct = round(((ltp - cl) / cl) * 100, 2)
             is_vol_break = (vol > 500000 and pct >= 1.0 and vol > avg_vols.get(s, 0))
             
-            # Historical Data for Indicators
-            hist_1h = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "60minute")
-            # period=20, offset=6 as per your TradingView screenshot
-            bb_status = get_bb_median_status(pd.DataFrame(hist_1h), period=20, offset=6) if len(hist_1h) >= 30 else "N/A"
-            
-            hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=5), now_ist, "15minute")
+            # Historical 15m data for Donchian Channel calculation
+            hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "15minute")
             df_15m = pd.DataFrame(hist_15m)
-            is_ema_cross = calculate_ema(df_15m['close'], 20).iloc[-1] > calculate_ema(df_15m['close'], 50).iloc[-1] if len(df_15m) >= 50 else False
+            
+            # Donchian Upper Breakout Check
+            dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
 
             sym_short = s.replace("NSE:", "")
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # Alert Trigger Logic
+            # Trigger Browser Alert only during live market hours
             alert_type = ""
-            if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
-                alert_type = "Volume Breakout"
-            elif "🚀" in bb_status and f"{sym_short}|BB Median" not in alerted_keys:
-                alert_type = "BB Median 1H"
-            
-            if alert_type:
-                trigger_alert(sym_short, alert_type, ltp)
-                if tg_toggle and TG_TOKEN and TG_ID:
-                    send_telegram_msg(TG_TOKEN, TG_ID, f"🚀 <b>{alert_type}</b>\nStock: <b>{sym_short}</b>\nPrice: ₹{ltp}\n<a href='{tv_url}'>Chart 📈</a>")
-                st.session_state.alerts_history.append({"Symbol": sym_short, "Type": alert_type, "Time": now_ist.strftime("%H:%M:%S"), "LTP": ltp, "Chart": tv_url})
+            if market_active:
+                if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
+                    alert_type = "Volume Breakout"
+                elif is_dc_breakout and f"{sym_short}|Donchian Upper" not in alerted_keys:
+                    alert_type = "Donchian Upper 15m"
+                
+                if alert_type:
+                    trigger_alert(sym_short, alert_type, ltp)
+                    st.session_state.alerts_history.append({
+                        "Symbol": sym_short, 
+                        "Type": alert_type, 
+                        "Time": now_ist.strftime("%H:%M:%S"), 
+                        "LTP": ltp, 
+                        "Chart": tv_url
+                    })
 
-            results.append({"Symbol": sym_short, "LTP": ltp, "Change %": pct, "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal", "EMA Status": "⚡ CROSS" if is_ema_cross else "Below", "BB Median (1H)": bb_status, "Chart": tv_url})
+            results.append({
+                "Symbol": sym_short, 
+                "LTP": ltp, 
+                "Change %": pct, 
+                "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal", 
+                "Donchian 15m (28,6)": dc_status, 
+                "Chart": tv_url
+            })
         except: continue
 
-    # --- 7. TABS & DISPLAY ---
-    t_main, t_vol, t_bb, t_ema, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 BB Median 1H", "⚡ EMA 15m", "📝 History"])
+    # --- 8. DASHBOARD DISPLAY ---
+    t_main, t_vol, t_dc, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 Donchian 15m", "📝 History"])
     col_config = {
         "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
         "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
@@ -225,12 +222,13 @@ if 'access_token' in st.session_state:
         df_res = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
         with t_main: st.dataframe(df_res, use_container_width=True, hide_index=True, column_config=col_config)
         with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
-        with t_bb: st.dataframe(df_res[df_res['BB Median (1H)'].str.contains("🚀|🛡️", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
-        with t_ema: st.dataframe(df_res[df_res['EMA Status'] == "⚡ CROSS"], use_container_width=True, hide_index=True, column_config=col_config)
+        with t_dc: st.dataframe(df_res[df_res['Donchian 15m (28,6)'].str.contains("🚀", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
     
     with t_log: 
         if st.session_state.alerts_history:
             st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
 
-    time.sleep(60)
-    st.rerun()
+    # Auto-refresh loop only executes during live market hours (9:07 AM to 3:30 PM IST)
+    if market_active:
+        time.sleep(60)
+        st.rerun()
