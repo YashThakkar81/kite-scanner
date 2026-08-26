@@ -8,7 +8,7 @@ import os
 import pytz 
 from datetime import datetime, timedelta, time as dtime
 
-# --- 1. CONFIGURATION & CUSTOM CSS ---
+# --- 1. CONFIGURATION & BLUE TOGGLE STYLING ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -19,12 +19,14 @@ st.markdown("""
     [data-testid="stDataFrame"] a { justify-content: center !important; }
     .stDataFrame { margin: 0 auto; }
     
-    /* Custom Blue Toggle Color */
-    div[data-testid="stToggleButton"] button[aria-checked="true"] {
+    /* Force Toggle Switch Active Background to Blue */
+    span[aria-checked="true"] {
         background-color: #1E88E5 !important;
-        border-color: #1E88E5 !important;
     }
-    input[type="checkbox"]:checked + div {
+    div[data-testid="stCheckbox"] input:checked + div {
+        background-color: #1E88E5 !important;
+    }
+    div[class*="st-"] [aria-checked="true"] {
         background-color: #1E88E5 !important;
     }
     </style>
@@ -166,6 +168,8 @@ if 'access_token' in st.session_state:
         except: continue
     
     symbols = ["NSE:" + s.strip() for s in set(all_syms) if s not in ['nan', 'Symbol']][:200]
+    total_fetched_count = len(symbols)
+    
     if not symbols:
         st.warning("No symbols found in Google Sheet.")
         st.stop()
@@ -225,30 +229,48 @@ if 'access_token' in st.session_state:
             })
         except: continue
 
-    # --- 8. DASHBOARD DISPLAY ---
-    t_main, t_vol, t_dc, t_log = st.tabs(["📊 Market", "🔥 Volume", "🎯 Donchian 15m", "📝 History"])
-    col_config = {
-        "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-        "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
-        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
-    }
-
+    # --- 8. DASHBOARD DISPLAY & SYMBOL COUNTERS ---
     if results:
-        df_res = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
+        df_full = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
         
-        # Filter table based on "Show All Stocks (< 1%)" toggle
-        if not show_all_stocks:
-            df_res = df_res[df_res['Change %'] >= 1.0]
+        # Apply < 1% filter if toggle is disabled
+        df_display = df_full if show_all_stocks else df_full[df_full['Change %'] >= 1.0]
+        
+        vol_count = len(df_display[df_display['Vol Status'] == "🚀 BREAKOUT"])
+        dc_count = len(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
+        history_count = len(st.session_state.alerts_history)
 
-        with t_main: st.dataframe(df_res, use_container_width=True, hide_index=True, column_config=col_config)
-        with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
-        with t_dc: st.dataframe(df_res[df_res['Donchian 15m (28,6)'].str.contains("🚀", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
-    
-    with t_log: 
-        if st.session_state.alerts_history:
-            st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
+        # Header Metrics Bar for Symbol Counts
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Sheet Symbols", f"{total_fetched_count}")
+        c2.metric("Active Filtered Stocks", f"{len(df_display)}")
+        c3.metric("Breakout Alerts Logged", f"{history_count}")
 
-    # Auto-refresh loop only executes during live market hours (9:07 AM to 3:30 PM IST)
+        # Dynamic Tabs with Item Count Badges
+        t_main, t_vol, t_dc, t_log = st.tabs([
+            f"📊 Market ({len(df_display)})", 
+            f"🔥 Volume ({vol_count})", 
+            f"🎯 Donchian 15m ({dc_count})", 
+            f"📝 History ({history_count})"
+        ])
+
+        col_config = {
+            "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
+            "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
+            "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
+        }
+
+        with t_main: 
+            st.dataframe(df_display, use_container_width=True, hide_index=True, column_config=col_config)
+        with t_vol: 
+            st.dataframe(df_display[df_display['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
+        with t_dc: 
+            st.dataframe(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
+        with t_log: 
+            if st.session_state.alerts_history:
+                st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
+
+    # Auto-refresh loop during live market hours
     if market_active:
         time.sleep(60)
         st.rerun()
