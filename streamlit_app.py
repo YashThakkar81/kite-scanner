@@ -8,7 +8,7 @@ import os
 import pytz 
 from datetime import datetime, timedelta, time as dtime
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION & CUSTOM CSS ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -18,6 +18,15 @@ st.markdown("""
     [data-testid="stHeader"] th { text-align: center !important; }
     [data-testid="stDataFrame"] a { justify-content: center !important; }
     .stDataFrame { margin: 0 auto; }
+    
+    /* Custom Blue Toggle Color */
+    div[data-testid="stToggleButton"] button[aria-checked="true"] {
+        background-color: #1E88E5 !important;
+        border-color: #1E88E5 !important;
+    }
+    input[type="checkbox"]:checked + div {
+        background-color: #1E88E5 !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -66,7 +75,6 @@ def get_donchian_status(df, length=28, offset=6):
     if len(df) < (length + offset):
         return "N/A", False
 
-    # Upper channel calculation: 28-period max shifted forward by offset 6
     upper_channel = df['high'].rolling(window=length).max().shift(offset)
     
     curr_close = df['close'].iloc[-1]
@@ -103,7 +111,7 @@ def is_market_open():
     market_end = dtime(15, 30)
     return market_start <= now.time() <= market_end
 
-# --- 6. SIDEBAR (AUTHENTICATION, STATUS & NOTIFICATION TOGGLES) ---
+# --- 6. SIDEBAR (AUTHENTICATION, STATUS & TOGGLES) ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
     now_ist = datetime.now(IST)
@@ -116,7 +124,8 @@ with st.sidebar:
         st.warning("Market Status: CLOSED (Manual Mode / Backtest) 🔴")
 
     st.divider()
-    st.header("🔔 Notification Controls")
+    st.header("⚙️ Display & Alert Controls")
+    show_all_stocks = st.toggle("Show All Stocks (< 1%)", value=False)
     notify_vol = st.toggle("Enable Volume Alerts", value=True)
     notify_dc = st.toggle("Enable Donchian Alerts", value=False)
 
@@ -226,6 +235,11 @@ if 'access_token' in st.session_state:
 
     if results:
         df_res = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
+        
+        # Filter table based on "Show All Stocks (< 1%)" toggle
+        if not show_all_stocks:
+            df_res = df_res[df_res['Change %'] >= 1.0]
+
         with t_main: st.dataframe(df_res, use_container_width=True, hide_index=True, column_config=col_config)
         with t_vol: st.dataframe(df_res[df_res['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
         with t_dc: st.dataframe(df_res[df_res['Donchian 15m (28,6)'].str.contains("🚀", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
