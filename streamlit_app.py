@@ -103,7 +103,7 @@ def is_market_open():
     market_end = dtime(15, 30)
     return market_start <= now.time() <= market_end
 
-# --- 6. SIDEBAR (AUTHENTICATION & STATUS) ---
+# --- 6. SIDEBAR (AUTHENTICATION, STATUS & NOTIFICATION TOGGLES) ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
     now_ist = datetime.now(IST)
@@ -115,12 +115,18 @@ with st.sidebar:
     else:
         st.warning("Market Status: CLOSED (Manual Mode / Backtest) 🔴")
 
+    st.divider()
+    st.header("🔔 Notification Controls")
+    notify_vol = st.toggle("Enable Volume Alerts", value=True)
+    notify_dc = st.toggle("Enable Donchian Alerts", value=False)
+
     if 'access_token' in st.session_state:
         st.divider()
         st.success("Kite Connected ✅")
         st.code(st.session_state.access_token, language="text")
 
     if 'access_token' not in st.session_state:
+        st.divider()
         st.link_button("1. Get Login URL", st.session_state.kite.login_url(), use_container_width=True)
         token_in = st.text_input("2. Enter Request Token")
         if st.button("🚀 Activate Session", use_container_width=True):
@@ -182,12 +188,12 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # Trigger Browser Alert only during live market hours
+            # Trigger Browser Alert based on sidebar toggle preferences
             alert_type = ""
             if market_active:
-                if is_vol_break and f"{sym_short}|Volume" not in alerted_keys:
+                if notify_vol and is_vol_break and f"{sym_short}|Volume Breakout" not in alerted_keys:
                     alert_type = "Volume Breakout"
-                elif is_dc_breakout and f"{sym_short}|Donchian Upper" not in alerted_keys:
+                elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
                     alert_type = "Donchian Upper 15m"
                 
                 if alert_type:
