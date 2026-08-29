@@ -19,7 +19,7 @@ st.markdown("""
     [data-testid="stDataFrame"] a { justify-content: center !important; }
     .stDataFrame { margin: 0 auto; }
     
-    /* Blue Toggle Switch Styling */
+    /* Blue Toggle Switch Accent */
     span[aria-checked="true"] {
         background-color: #1E88E5 !important;
     }
@@ -86,10 +86,9 @@ def get_donchian_status(df, length=28, offset=6):
 
     is_breakout = curr_close >= curr_upper
     status_str = "🚀 UPPER BREAKOUT" if is_breakout else "Below"
-    
     return status_str, is_breakout
 
-@st.cache_data(ttl="1d")
+@st.cache_data(ttl=3600)
 def get_daily_avg_vol(_kite, symbols):
     avg_vol_map = {}
     to_date = datetime.now(IST).date()
@@ -99,20 +98,20 @@ def get_daily_avg_vol(_kite, symbols):
             q = _kite.quote(s)[s]
             hist = _kite.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
             avg_vol_map[s] = sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
-            time.sleep(0.01) 
-        except: avg_vol_map[s] = 999999999
+        except: 
+            avg_vol_map[s] = 999999999
     return avg_vol_map
 
 # --- 5. MARKET HOURS UTILITY ---
 def is_market_open():
     now = datetime.now(IST)
-    if now.weekday() >= 5: # Saturday or Sunday
+    if now.weekday() >= 5:
         return False
     market_start = dtime(9, 7)
     market_end = dtime(15, 30)
     return market_start <= now.time() <= market_end
 
-# --- 6. SIDEBAR (AUTHENTICATION, STATUS & TOGGLES) ---
+# --- 6. SIDEBAR ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
     now_ist = datetime.now(IST)
@@ -154,9 +153,8 @@ with st.sidebar:
             st.session_state.clear()
             st.rerun()
 
-# --- 7. MAIN DATA PROCESSING & EXECUTION ---
+# --- 7. MAIN DATA PROCESSING ---
 if 'access_token' in st.session_state:
-    # 5 Sheets mapped identically to Google Apps Script
     sheets = ["Scanner_Output 1", "Scanner_Output 2", "Scanner_Output 3", "Indices", "GF_Scanner"]
     all_syms = []
     
@@ -167,56 +165,51 @@ if 'access_token' in st.session_state:
                 all_syms.extend(df_sheet.iloc[:, 0].dropna().astype(str).tolist())
         except: continue
     
-    # Clean symbol parsing matching Apps Script REGEX
-    clean_symbols = []
-    for s in set(all_syms):
-        s_str = str(s).strip()
-        if '=" ' in s_str or '="' in s_str:
-            s_str = s_str.split('"')[1] if '"' in s_str else s_str
-        s_str = s_str.replace('="', '').replace('"', '').strip().upper()
-        if s_str and s_str not in ['NAN', 'SYMBOL', 'INDEX']:
-            clean_symbols.append(s_str)
-
-    symbols = ["NSE:" + s for s in clean_symbols]
+    symbols = ["NSE:" + s.strip().replace('"', '') for s in set(all_syms) if s.strip() and s.strip() not in ['nan', 'Symbol']]
     total_fetched_count = len(symbols)
     
     if not symbols:
-        st.warning("No symbols found across worksheets.")
+        st.warning("No symbols found in Google Sheets.")
         st.stop()
 
     avg_vols = get_daily_avg_vol(st.session_state.kite, symbols)
     results = []
 
+    # Fast batch quote processing
+    full_quotes = {}
     try:
-        # Batch Fetching in 100-item chunks (identical to Apps Script chunking)
-        full_quotes = {}
         for i in range(0, len(symbols), 100):
-            chunk = symbols[i:i+100]
+            chunk = symbols[i:i + 100]
             full_quotes.update(st.session_state.kite.quote(chunk))
     except Exception as e:
-        st.error(f"Kite API Error: {e}. Please re-login via sidebar.")
+        st.error("Kite API Error / Token Expired. Please re-login via sidebar.")
         st.stop()
 
     for s in symbols:
         try:
-            q = full_quotes[s]
+            q = full_quotes.get(s)
+            if not q: continue
+
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             pct = round(((ltp - cl) / cl) * 100, 2)
+            avg_vol = avg_vols.get(s, 0)
             
-            # Exact Volume Breakout Logic matching Apps Script V39.3
-            avg_v = avg_vols.get(s, 0)
-            is_vol_break = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
+            is_vol_break = (vol > 500000 and pct >= 1.0 and vol > (avg_vol * 1.1))
             
-            # 15m Donchian Channel Check
-            hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=10), now_ist, "15minute")
-            df_15m = pd.DataFrame(hist_15m)
-            dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
+            # Fetch Donchian Data conditionally or safely catch errors
+            dc_status, is_dc_breakout = "Below", False
+            try:
+                hist_15m = st.session_state.kite.historical_data(q['instrument_token'], now_ist-timedelta(days=7), now_ist, "15minute")
+                if hist_15m:
+                    df_15m = pd.DataFrame(hist_15m)
+                    dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
+            except:
+                dc_status = "N/A"
 
             sym_short = s.replace("NSE:", "")
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # Trigger Browser Alert based on sidebar toggles
             alert_type = ""
             if market_active:
                 if notify_vol and is_vol_break and f"{sym_short}|Volume Breakout" not in alerted_keys:
@@ -244,39 +237,25 @@ if 'access_token' in st.session_state:
             })
         except: continue
 
-    # Load direct Google Sheet Alert_Log for full 120+ symbol sync
-    try:
-        df_sheet_log = conn.read(worksheet="Alert_Log")
-        sheet_log_count = len(df_sheet_log) if not df_sheet_log.empty else 0
-    except:
-        df_sheet_log = pd.DataFrame()
-        sheet_log_count = 0
-
-    # --- 8. DASHBOARD DISPLAY & SYMBOL COUNTERS ---
+    # --- 8. DASHBOARD DISPLAY ---
     if results:
         df_full = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
-        
-        # Apply < 1% filter if toggle is disabled
         df_display = df_full if show_all_stocks else df_full[df_full['Change %'] >= 1.0]
         
         vol_count = len(df_display[df_display['Vol Status'] == "🚀 BREAKOUT"])
         dc_count = len(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
         history_count = len(st.session_state.alerts_history)
 
-        # Header Metrics Bar
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Total Sheet Symbols", f"{total_fetched_count}")
         c2.metric("Active Filtered Stocks", f"{len(df_display)}")
-        c3.metric("GSheets Alert_Log Count", f"{sheet_log_count}")
-        c4.metric("Live PC Alerts Logged", f"{history_count}")
+        c3.metric("Breakout Alerts Logged", f"{history_count}")
 
-        # Dynamic Tabs with Item Count Badges
-        t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
+        t_main, t_vol, t_dc, t_log = st.tabs([
             f"📊 Market ({len(df_display)})", 
             f"🔥 Volume ({vol_count})", 
-            f"🎯 Donchian 15m ({dc_count})",
-            f"📋 GSheet Alert_Log ({sheet_log_count})",
-            f"📝 Live History ({history_count})"
+            f"🎯 Donchian 15m ({dc_count})", 
+            f"📝 History ({history_count})"
         ])
 
         col_config = {
@@ -291,16 +270,10 @@ if 'access_token' in st.session_state:
             st.dataframe(df_display[df_display['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
         with t_dc: 
             st.dataframe(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
-        with t_gsheet_log:
-            if not df_sheet_log.empty:
-                st.dataframe(df_sheet_log, use_container_width=True, hide_index=True)
-            else:
-                st.info("No records in Google Sheet Alert_Log yet.")
         with t_log: 
             if st.session_state.alerts_history:
                 st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
 
-    # Auto-refresh loop during live market hours
     if market_active:
         time.sleep(60)
         st.rerun()
