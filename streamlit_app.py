@@ -6,6 +6,7 @@ import streamlit.components.v1 as components
 import time
 import os
 import pytz 
+import requests 
 from datetime import datetime, timedelta, time as dtime
 
 # --- 1. CONFIGURATION & BLUE TOGGLE STYLING ---
@@ -40,8 +41,33 @@ except Exception as e:
     st.error(f"Setup Error: {e}")
     st.stop()
 
-# --- 2. PC NOTIFICATION ENGINE ---
+# --- 2. PC & TELEGRAM NOTIFICATION ENGINE ---
+def send_telegram_alert(symbol, alert_type, ltp):
+    try:
+        bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
+        chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+        
+        tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+        message = (
+            f"🚀 *{alert_type} ALERT*\n\n"
+            f"*Symbol:* `{symbol}`\n"
+            f"*LTP:* ₹{ltp}\n"
+            f"📈 [Open Chart]({tv_url})"
+        )
+        
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        requests.post(url, data=payload, timeout=5)
+    except Exception as e:
+        pass
+
 def trigger_alert(symbol, alert_type, ltp):
+    # Browser Toast & Desktop Notifications (Runs when tab is open)
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
@@ -56,6 +82,9 @@ def trigger_alert(symbol, alert_type, ltp):
     """
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
+    
+    # Push notification to Telegram (Works when mobile is locked)
+    send_telegram_alert(symbol, alert_type, ltp)
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
