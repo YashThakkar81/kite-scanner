@@ -5,8 +5,8 @@ from streamlit_gsheets import GSheetsConnection
 import streamlit.components.v1 as components
 import time
 import os
-import pytz 
-import requests 
+import pytz
+import requests
 from datetime import datetime, timedelta, time as dtime
 
 # --- 1. CONFIGURATION & BLUE TOGGLE STYLING ---
