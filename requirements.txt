@@ -3,3 +3,4 @@ kiteconnect
 pandas
 st-gsheets-connection
 pytz
+requests
