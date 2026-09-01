@@ -67,7 +67,6 @@ def send_telegram_alert(symbol, alert_type, ltp):
         pass
 
 def trigger_alert(symbol, alert_type, ltp):
-    # Browser Toast & Desktop Notifications (Runs when tab is open)
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
@@ -83,7 +82,6 @@ def trigger_alert(symbol, alert_type, ltp):
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
     
-    # Push notification to Telegram (Works when mobile is locked)
     send_telegram_alert(symbol, alert_type, ltp)
 
 # --- 3. SESSION STATE ---
@@ -136,7 +134,6 @@ def get_daily_avg_vol(access_token, api_key, symbols):
     to_date = datetime.now(IST).date()
     from_date = to_date - timedelta(days=35)
     
-    # Process in chunks to prevent timeout
     for i in range(0, len(symbols), 100):
         chunk = symbols[i:i+100]
         try:
@@ -157,7 +154,7 @@ def get_daily_avg_vol(access_token, api_key, symbols):
 # --- 5. MARKET HOURS UTILITY ---
 def is_market_open():
     now = datetime.now(IST)
-    if now.weekday() >= 5: # Saturday or Sunday
+    if now.weekday() >= 5:
         return False
     market_start = dtime(9, 7)
     market_end = dtime(15, 30)
@@ -178,8 +175,9 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Display & Alert Controls")
     show_all_stocks = st.toggle("Show All Stocks (< 1%)", value=False)
-    notify_vol = st.toggle("Enable Volume Alerts", value=True)
-    notify_dc = st.toggle("Enable Donchian Alerts", value=False)
+    notify_combo = st.toggle("Enable Happy Breakout (Vol + Donchian)", value=True)
+    notify_vol = st.toggle("Enable Individual Volume Alerts", value=False)
+    notify_dc = st.toggle("Enable Individual Donchian Alerts", value=False)
 
     if 'access_token' in st.session_state:
         st.divider()
@@ -256,7 +254,6 @@ if 'access_token' in st.session_state:
             avg_v = avg_vols.get(s, 0)
             is_vol_break = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
             
-            # Fast filter: Don't fetch 15m historical candles for stocks < 1% unless show_all_stocks is checked
             if show_all_stocks or pct >= 1.0 or is_vol_break:
                 df_15m = fetch_15m_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
@@ -267,9 +264,13 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
+            is_combo_breakout = is_vol_break and is_dc_breakout
+
             alert_type = ""
             if market_active:
-                if notify_vol and is_vol_break and f"{sym_short}|Volume Breakout" not in alerted_keys:
+                if notify_combo and is_combo_breakout and f"{sym_short}|Happy Breakout" not in alerted_keys:
+                    alert_type = "Happy Breakout"
+                elif notify_vol and is_vol_break and f"{sym_short}|Volume Breakout" not in alerted_keys:
                     alert_type = "Volume Breakout"
                 elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
                     alert_type = "Donchian Upper 15m"
@@ -306,6 +307,11 @@ if 'access_token' in st.session_state:
         df_full = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
         df_display = df_full if show_all_stocks else df_full[df_full['Change %'] >= 1.0]
         
+        df_combo = df_display[
+            (df_display['Vol Status'] == "🚀 BREAKOUT") & 
+            (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
+        ]
+        combo_count = len(df_combo)
         vol_count = len(df_display[df_display['Vol Status'] == "🚀 BREAKOUT"])
         dc_count = len(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
         history_count = len(st.session_state.alerts_history)
@@ -316,10 +322,11 @@ if 'access_token' in st.session_state:
         c3.metric("GSheets Alert_Log Count", f"{sheet_log_count}")
         c4.metric("Live PC Alerts Logged", f"{history_count}")
 
-        t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
+        t_combo, t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
+            f"🎯 Happy Breakout ({combo_count})",
             f"📊 Market ({len(df_display)})", 
             f"🔥 Volume ({vol_count})", 
-            f"🎯 Donchian 15m ({dc_count})",
+            f"📈 Donchian 15m ({dc_count})",
             f"📋 GSheet Alert_Log ({sheet_log_count})",
             f"📝 Live History ({history_count})"
         ])
@@ -330,6 +337,8 @@ if 'access_token' in st.session_state:
             "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
         }
 
+        with t_combo:
+            st.dataframe(df_combo, use_container_width=True, hide_index=True, column_config=col_config)
         with t_main: 
             st.dataframe(df_display, use_container_width=True, hide_index=True, column_config=col_config)
         with t_vol: 
