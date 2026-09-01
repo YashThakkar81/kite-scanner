@@ -213,11 +213,9 @@ if 'access_token' in st.session_state:
         try:
             df_sheet = conn.read(worksheet=ws)
             if not df_sheet.empty:
-                # Get symbol list from the first column
                 syms_in_sheet = df_sheet.iloc[:, 0].dropna().astype(str).tolist()
                 all_syms.extend(syms_in_sheet)
                 
-                # Dynamic percentage lookup from GSheet
                 pct_col_idx = None
                 for idx, col_name in enumerate(df_sheet.columns):
                     if "%" in str(col_name) or "CHANGE" in str(col_name).upper():
@@ -232,10 +230,13 @@ if 'access_token' in st.session_state:
                     
                     if s_clean and s_clean not in ['NAN', 'SYMBOL', 'INDEX']:
                         if pct_col_idx is not None:
-                            val = str(row.iloc[pct_col_idx]).replace('%', '').strip()
+                            val_str = str(row.iloc[pct_col_idx]).replace('%', '').strip()
                             try:
-                                parsed_pct = float(val)
-                                gsheet_pct_map[s_clean] = parsed_pct
+                                parsed_val = float(val_str)
+                                # If Google Sheets returns standard decimal values (e.g. 0.0162 for 1.62%), convert to base percent integer
+                                if abs(parsed_val) < 0.20 and parsed_val != 0:
+                                    parsed_val = parsed_val * 100.0
+                                gsheet_pct_map[s_clean] = parsed_val
                             except ValueError:
                                 pass
         except: continue
@@ -276,13 +277,16 @@ if 'access_token' in st.session_state:
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             sym_short = s.replace("NSE:", "")
             
-            # Use parsed GSheet % Change if present, otherwise calculate from Kite API
-            if sym_short in gsheet_pct_map:
+            # Accurate real-time Kite % calculation, falling back on parsed GSheet value
+            if cl > 0:
+                pct = round(((ltp - cl) / cl) * 100, 2)
+            elif sym_short in gsheet_pct_map:
                 pct = round(gsheet_pct_map[sym_short], 2)
             else:
-                pct = round(((ltp - cl) / cl) * 100, 2)
+                pct = 0.0
             
             avg_v = avg_vols.get(s, 0)
+            # Retained exact volume accumulation logic (vol > 500000)
             is_vol_break = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
             
             if show_all_stocks or pct >= 1.0 or is_vol_break:
@@ -327,6 +331,12 @@ if 'access_token' in st.session_state:
 
     try:
         df_sheet_log = conn.read(worksheet="Alert_Log")
+        if not df_sheet_log.empty:
+            # Fix decimal display issues directly within the Alert_Log tab as well
+            for col in df_sheet_log.columns:
+                if "%" in str(col) or "CHANGE" in str(col).upper():
+                    df_sheet_log[col] = pd.to_numeric(df_sheet_log[col].astype(str).str.replace('%', ''), errors='coerce')
+                    df_sheet_log[col] = df_sheet_log[col].apply(lambda x: x * 100.0 if abs(x) < 0.20 and x != 0 else x)
         sheet_log_count = len(df_sheet_log) if not df_sheet_log.empty else 0
     except:
         df_sheet_log = pd.DataFrame()
