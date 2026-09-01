@@ -207,12 +207,37 @@ with st.sidebar:
 if 'access_token' in st.session_state:
     sheets = ["Scanner_Output 1", "Scanner_Output 2", "Scanner_Output 3", "Indices", "GF_Scanner"]
     all_syms = []
+    gsheet_pct_map = {}
     
     for ws in sheets:
         try:
             df_sheet = conn.read(worksheet=ws)
             if not df_sheet.empty:
-                all_syms.extend(df_sheet.iloc[:, 0].dropna().astype(str).tolist())
+                # Get symbol list from the first column
+                syms_in_sheet = df_sheet.iloc[:, 0].dropna().astype(str).tolist()
+                all_syms.extend(syms_in_sheet)
+                
+                # Dynamic percentage lookup from GSheet
+                pct_col_idx = None
+                for idx, col_name in enumerate(df_sheet.columns):
+                    if "%" in str(col_name) or "CHANGE" in str(col_name).upper():
+                        pct_col_idx = idx
+                        break
+                
+                for _, row in df_sheet.iterrows():
+                    s_raw = str(row.iloc[0]).strip()
+                    if '="' in s_raw:
+                        s_raw = s_raw.split('"')[1] if '"' in s_raw else s_raw
+                    s_clean = s_raw.replace('="', '').replace('"', '').strip().upper()
+                    
+                    if s_clean and s_clean not in ['NAN', 'SYMBOL', 'INDEX']:
+                        if pct_col_idx is not None:
+                            val = str(row.iloc[pct_col_idx]).replace('%', '').strip()
+                            try:
+                                parsed_pct = float(val)
+                                gsheet_pct_map[s_clean] = parsed_pct
+                            except ValueError:
+                                pass
         except: continue
     
     clean_symbols = []
@@ -249,7 +274,13 @@ if 'access_token' in st.session_state:
             if not q: continue
             
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
-            pct = round(((ltp - cl) / cl) * 100, 2)
+            sym_short = s.replace("NSE:", "")
+            
+            # Use parsed GSheet % Change if present, otherwise calculate from Kite API
+            if sym_short in gsheet_pct_map:
+                pct = round(gsheet_pct_map[sym_short], 2)
+            else:
+                pct = round(((ltp - cl) / cl) * 100, 2)
             
             avg_v = avg_vols.get(s, 0)
             is_vol_break = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
@@ -260,7 +291,6 @@ if 'access_token' in st.session_state:
             else:
                 dc_status, is_dc_breakout = "Below", False
 
-            sym_short = s.replace("NSE:", "")
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
