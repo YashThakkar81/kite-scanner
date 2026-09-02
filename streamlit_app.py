@@ -175,7 +175,8 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Display & Alert Controls")
     show_all_stocks = st.toggle("Show All Stocks (< 1%)", value=False)
-    notify_combo = st.toggle("Enable Happy Breakout (Vol + Donchian)", value=True)
+    notify_combo = st.toggle("Enable Happy Breakout (500K Vol + Donchian)", value=True)
+    notify_early = st.toggle("Enable Early Watchlist Alert (100K Vol + Donchian)", value=True)
     notify_vol = st.toggle("Enable Individual Volume Alerts", value=False)
     notify_dc = st.toggle("Enable Individual Donchian Alerts", value=False)
 
@@ -233,7 +234,6 @@ if 'access_token' in st.session_state:
                             val_str = str(row.iloc[pct_col_idx]).replace('%', '').strip()
                             try:
                                 parsed_val = float(val_str)
-                                # If Google Sheets returns standard decimal values (e.g. 0.0162 for 1.62%), convert to base percent integer
                                 if abs(parsed_val) < 0.20 and parsed_val != 0:
                                     parsed_val = parsed_val * 100.0
                                 gsheet_pct_map[s_clean] = parsed_val
@@ -286,10 +286,12 @@ if 'access_token' in st.session_state:
                 pct = 0.0
             
             avg_v = avg_vols.get(s, 0)
-            # Retained exact volume accumulation logic (vol > 500000)
-            is_vol_break = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
             
-            if show_all_stocks or pct >= 1.0 or is_vol_break:
+            # Dual Volume Threshold Logic
+            is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
+            is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
+            
+            if show_all_stocks or pct >= 1.0 or is_vol_break_100k:
                 df_15m = fetch_15m_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
             else:
@@ -298,13 +300,17 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            is_combo_breakout = is_vol_break and is_dc_breakout
+            # Signal conditions
+            is_happy_breakout = is_vol_break_500k and is_dc_breakout
+            is_early_alert = is_vol_break_100k and (not is_vol_break_500k) and is_dc_breakout
 
             alert_type = ""
             if market_active:
-                if notify_combo and is_combo_breakout and f"{sym_short}|Happy Breakout" not in alerted_keys:
+                if notify_combo and is_happy_breakout and f"{sym_short}|Happy Breakout" not in alerted_keys:
                     alert_type = "Happy Breakout"
-                elif notify_vol and is_vol_break and f"{sym_short}|Volume Breakout" not in alerted_keys:
+                elif notify_early and is_early_alert and f"{sym_short}|Early Watchlist Alert" not in alerted_keys:
+                    alert_type = "Early Watchlist Alert"
+                elif notify_vol and is_vol_break_500k and f"{sym_short}|Volume Breakout" not in alerted_keys:
                     alert_type = "Volume Breakout"
                 elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
                     alert_type = "Donchian Upper 15m"
@@ -319,11 +325,13 @@ if 'access_token' in st.session_state:
                         "Chart": tv_url
                     })
 
+            vol_status_label = "🚀 BREAKOUT" if is_vol_break_500k else ("👀 WATCH (100K)" if is_vol_break_100k else "Normal")
+
             results.append({
                 "Symbol": sym_short, 
                 "LTP": ltp, 
                 "Change %": pct, 
-                "Vol Status": "🚀 BREAKOUT" if is_vol_break else "Normal", 
+                "Vol Status": vol_status_label, 
                 "Donchian 15m (28,6)": dc_status, 
                 "Chart": tv_url
             })
@@ -332,7 +340,6 @@ if 'access_token' in st.session_state:
     try:
         df_sheet_log = conn.read(worksheet="Alert_Log")
         if not df_sheet_log.empty:
-            # Fix decimal display issues directly within the Alert_Log tab as well
             for col in df_sheet_log.columns:
                 if "%" in str(col) or "CHANGE" in str(col).upper():
                     df_sheet_log[col] = pd.to_numeric(df_sheet_log[col].astype(str).str.replace('%', ''), errors='coerce')
@@ -351,8 +358,15 @@ if 'access_token' in st.session_state:
             (df_display['Vol Status'] == "🚀 BREAKOUT") & 
             (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
         ]
+        
+        df_early = df_display[
+            (df_display['Vol Status'] == "👀 WATCH (100K)") & 
+            (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
+        ]
+
         combo_count = len(df_combo)
-        vol_count = len(df_display[df_display['Vol Status'] == "🚀 BREAKOUT"])
+        early_count = len(df_early)
+        vol_count = len(df_display[df_display['Vol Status'].str.contains("BREAKOUT|WATCH", regex=True, na=False)])
         dc_count = len(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
         history_count = len(st.session_state.alerts_history)
 
@@ -362,8 +376,9 @@ if 'access_token' in st.session_state:
         c3.metric("GSheets Alert_Log Count", f"{sheet_log_count}")
         c4.metric("Live PC Alerts Logged", f"{history_count}")
 
-        t_combo, t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
+        t_combo, t_early, t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
             f"🎯 Happy Breakout ({combo_count})",
+            f"👀 Early Watch ({early_count})",
             f"📊 Market ({len(df_display)})", 
             f"🔥 Volume ({vol_count})", 
             f"📈 Donchian 15m ({dc_count})",
@@ -379,10 +394,12 @@ if 'access_token' in st.session_state:
 
         with t_combo:
             st.dataframe(df_combo, use_container_width=True, hide_index=True, column_config=col_config)
+        with t_early:
+            st.dataframe(df_early, use_container_width=True, hide_index=True, column_config=col_config)
         with t_main: 
             st.dataframe(df_display, use_container_width=True, hide_index=True, column_config=col_config)
         with t_vol: 
-            st.dataframe(df_display[df_display['Vol Status'] == "🚀 BREAKOUT"], use_container_width=True, hide_index=True, column_config=col_config)
+            st.dataframe(df_display[df_display['Vol Status'].str.contains("BREAKOUT|WATCH", regex=True, na=False)], use_container_width=True, hide_index=True, column_config=col_config)
         with t_dc: 
             st.dataframe(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)], use_container_width=True, hide_index=True, column_config=col_config)
         with t_gsheet_log:
