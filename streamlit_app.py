@@ -5,6 +5,7 @@ from streamlit_gsheets import GSheetsConnection
 import streamlit.components.v1 as components
 import time
 import os
+import json
 import pytz
 import requests
 from datetime import datetime, timedelta, time as dtime
@@ -41,36 +42,104 @@ except Exception as e:
     st.error(f"Setup Error: {e}")
     st.stop()
 
+ACTIVE_TRADES_FILE = "active_trades.json"
+
+# --- PERSISTENT ACTIVE TRADES STORAGE UTILS ---
+def load_active_trades():
+    if os.path.exists(ACTIVE_TRADES_FILE):
+        try:
+            with open(ACTIVE_TRADES_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_active_trades(trades):
+    try:
+        with open(ACTIVE_TRADES_FILE, "w") as f:
+            json.dump(trades, f, indent=4)
+    except Exception:
+        pass
+
+# --- TECHNICAL HELPERS: ATR & PIVOT S1 ---
+def calculate_atr14(df):
+    if df is None or len(df) < 15:
+        return 0.0
+    df = df.copy()
+    df['prev_close'] = df['close'].shift(1)
+    df['tr'] = df.apply(
+        lambda r: max(
+            r['high'] - r['low'],
+            abs(r['high'] - r['prev_close']) if pd.notna(r['prev_close']) else 0.0,
+            abs(r['low'] - r['prev_close']) if pd.notna(r['prev_close']) else 0.0
+        ), axis=1
+    )
+    atr = df['tr'].rolling(window=14).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) else 0.0
+
+def fetch_pivot_s1(kite_inst, instrument_token):
+    try:
+        now = datetime.now(IST)
+        from_date = now - timedelta(days=5)
+        hist = kite_inst.historical_data(instrument_token, from_date, now.date() - timedelta(days=1), "day")
+        if not hist or len(hist) < 1:
+            return 0.0
+        prev_day = hist[-1]
+        p = (prev_day['high'] + prev_day['low'] + prev_day['close']) / 3.0
+        s1 = (2 * p) - prev_day['high']
+        return round(float(s1), 2)
+    except Exception:
+        return 0.0
+
 # --- 2. PC & TELEGRAM NOTIFICATION ENGINE ---
-def send_telegram_alert(symbol, alert_type, ltp):
+def send_telegram_raw(message):
     try:
         bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
-        
-        tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-        message = (
-            f"🚀 *{alert_type} ALERT*\n\n"
-            f"*Symbol:* `{symbol}`\n"
-            f"*LTP:* ₹{ltp}\n"
-            f"📈 [Open Chart]({tv_url})"
-        )
-        
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": message,
-            "parse_mode": "Markdown",
             "disable_web_page_preview": True
         }
         requests.post(url, data=payload, timeout=5)
-    except Exception as e:
+    except Exception:
         pass
 
-def trigger_alert(symbol, alert_type, ltp):
+def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0):
+    if alert_type == "Happy Breakout":
+        message = (
+            f"HAPPY BREAKOUT: {symbol}\n\n"
+            f"Entry: ₹{ltp}\n"
+            f"SL 1: ₹{sl1}\n"
+            f"SL 2: ₹{sl2}"
+        )
+    else:
+        message = (
+            f"{alert_type.upper()}: {symbol}\n\n"
+            f"Entry: ₹{ltp}"
+        )
+    send_telegram_raw(message)
+
+def send_telegram_exit(symbol, exit_type, ltp):
+    message = (
+        f"{exit_type}: {symbol}\n\n"
+        f"LTP: ₹{ltp}"
+    )
+    send_telegram_raw(message)
+
+def send_telegram_eod_exit(symbols):
+    if not symbols:
+        return
+    sym_list = ", ".join(symbols)
+    message = f"EXIT FULL POSITION: {sym_list}"
+    send_telegram_raw(message)
+
+def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0):
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
-        const n = new Notification("{alert_type} ALERT: {symbol}", {{ 
+        const n = new Notification("{alert_type}: {symbol}", {{ 
             body: "Price: {ltp}",
             icon: "https://kite.zerodha.com/static/images/kite-logo.svg" 
         }});
@@ -82,7 +151,7 @@ def trigger_alert(symbol, alert_type, ltp):
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol}", icon="🚀")
     
-    send_telegram_alert(symbol, alert_type, ltp)
+    send_telegram_alert(symbol, alert_type, ltp, sl1=sl1, sl2=sl2)
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
@@ -97,7 +166,8 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
             saved_token = f.read().strip()
             st.session_state.kite.set_access_token(saved_token)
             st.session_state.access_token = saved_token
-    except: pass
+    except Exception:
+        pass
 
 # --- 4. DONCHIAN CHANNEL & CACHED HISTORICAL DATA ---
 def get_donchian_status(df, length=28, offset=6):
@@ -123,7 +193,7 @@ def fetch_15m_candles(access_token, api_key, instrument_token):
         now = datetime.now(IST)
         hist = kite_inst.historical_data(instrument_token, now - timedelta(days=10), now, "15minute")
         return pd.DataFrame(hist)
-    except:
+    except Exception:
         return None
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -146,9 +216,10 @@ def get_daily_avg_vol(access_token, api_key, symbols):
                         avg_vol_map[s] = sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
                     else:
                         avg_vol_map[s] = 999999999
-                except:
+                except Exception:
                     avg_vol_map[s] = 999999999
-        except: pass
+        except Exception:
+            pass
     return avg_vol_map
 
 # --- 5. MARKET HOURS UTILITY ---
@@ -159,6 +230,67 @@ def is_market_open():
     market_start = dtime(9, 7)
     market_end = dtime(15, 30)
     return market_start <= now.time() <= market_end
+
+# --- Dynamic EMA Exit Monitor Engine ---
+def process_active_trade_exits(kite_inst, access_token, api_key):
+    now_time = datetime.now(IST).time()
+    active_trades = load_active_trades()
+    if not active_trades:
+        return
+
+    # 3:15 PM EOD Consolidated Square-Off Trigger
+    if now_time >= dtime(15, 15):
+        eod_exit_symbols = []
+        for sym, data in list(active_trades.items()):
+            trig_dt = datetime.fromisoformat(data["trigger_time"])
+            # Evaluate trades triggered before 3:15 PM today
+            if trig_dt.time() <= dtime(15, 15):
+                eod_exit_symbols.append(sym)
+                del active_trades[sym]
+            else:
+                # Late triggers (> 3:15 PM) saved cleanly for next session watchlist
+                data["watchlist_next_session"] = True
+
+        if eod_exit_symbols:
+            send_telegram_eod_exit(eod_exit_symbols)
+        save_active_trades(active_trades)
+        return
+
+    # Regular intraday 15m candle-close check
+    updated = False
+    for sym, data in list(active_trades.items()):
+        inst_token = data.get("instrument_token")
+        if not inst_token:
+            continue
+
+        df_15m = fetch_15m_candles(access_token, api_key, inst_token)
+        if df_15m is None or len(df_15m) < 15:
+            continue
+
+        df_15m['ema5'] = df_15m['close'].ewm(span=5, adjust=False).mean()
+        df_15m['ema9'] = df_15m['close'].ewm(span=9, adjust=False).mean()
+
+        last_close = df_15m['close'].iloc[-1]
+        last_ema5 = df_15m['ema5'].iloc[-1]
+        last_ema9 = df_15m['ema9'].iloc[-1]
+
+        # EXIT 1: 15m Candle Close Below 5 EMA
+        if not data.get("exit1_triggered", False):
+            if last_close < last_ema5:
+                send_telegram_exit(sym, "EXIT 1", round(last_close, 2))
+                data["exit1_triggered"] = True
+                updated = True
+
+        # FINAL EXIT: 15m Candle Close Below 9 EMA
+        if not data.get("final_exit_triggered", False):
+            if last_close < last_ema9:
+                send_telegram_exit(sym, "FINAL EXIT", round(last_close, 2))
+                data["final_exit_triggered"] = True
+                del active_trades[sym]
+                updated = True
+
+    if updated:
+        save_active_trades(active_trades)
 
 # --- 6. SIDEBAR ---
 with st.sidebar:
@@ -239,7 +371,8 @@ if 'access_token' in st.session_state:
                                 gsheet_pct_map[s_clean] = parsed_val
                             except ValueError:
                                 pass
-        except: continue
+        except Exception:
+            continue
     
     clean_symbols = []
     for s in set(all_syms):
@@ -295,6 +428,7 @@ if 'access_token' in st.session_state:
                 df_15m = fetch_15m_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
             else:
+                df_15m = None
                 dc_status, is_dc_breakout = "Below", False
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
@@ -316,7 +450,26 @@ if 'access_token' in st.session_state:
                     alert_type = "Donchian Upper 15m"
                 
                 if alert_type:
-                    trigger_alert(sym_short, alert_type, ltp)
+                    sl1_val, sl2_val = 0.0, 0.0
+                    if alert_type == "Happy Breakout":
+                        atr_val = calculate_atr14(df_15m)
+                        sl1_val = round(ltp - (1.5 * atr_val), 2)
+                        sl2_val = fetch_pivot_s1(st.session_state.kite, q['instrument_token'])
+                        
+                        # Store in persistent background tracking list for EMA dynamic exits
+                        active_trades = load_active_trades()
+                        active_trades[sym_short] = {
+                            "instrument_token": q['instrument_token'],
+                            "entry_price": ltp,
+                            "sl1": sl1_val,
+                            "sl2": sl2_val,
+                            "trigger_time": datetime.now(IST).isoformat(),
+                            "exit1_triggered": False,
+                            "final_exit_triggered": False
+                        }
+                        save_active_trades(active_trades)
+
+                    trigger_alert(sym_short, alert_type, ltp, sl1=sl1_val, sl2=sl2_val)
                     st.session_state.alerts_history.append({
                         "Symbol": sym_short, 
                         "Type": alert_type, 
@@ -335,7 +488,12 @@ if 'access_token' in st.session_state:
                 "Donchian 15m (28,6)": dc_status, 
                 "Chart": tv_url
             })
-        except: continue
+        except Exception:
+            continue
+
+    # Process background 15m EMA Candle-Close Exit Alerts
+    if market_active:
+        process_active_trade_exits(st.session_state.kite, st.session_state.access_token, API_KEY)
 
     try:
         df_sheet_log = conn.read(worksheet="Alert_Log")
@@ -345,7 +503,7 @@ if 'access_token' in st.session_state:
                     df_sheet_log[col] = pd.to_numeric(df_sheet_log[col].astype(str).str.replace('%', ''), errors='coerce')
                     df_sheet_log[col] = df_sheet_log[col].apply(lambda x: x * 100.0 if abs(x) < 0.20 and x != 0 else x)
         sheet_log_count = len(df_sheet_log) if not df_sheet_log.empty else 0
-    except:
+    except Exception:
         df_sheet_log = pd.DataFrame()
         sheet_log_count = 0
 
