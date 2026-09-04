@@ -243,12 +243,10 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
         eod_exit_symbols = []
         for sym, data in list(active_trades.items()):
             trig_dt = datetime.fromisoformat(data["trigger_time"])
-            # Evaluate trades triggered before 3:15 PM today
             if trig_dt.time() <= dtime(15, 15):
                 eod_exit_symbols.append(sym)
                 del active_trades[sym]
             else:
-                # Late triggers (> 3:15 PM) saved cleanly for next session watchlist
                 data["watchlist_next_session"] = True
 
         if eod_exit_symbols:
@@ -410,7 +408,6 @@ if 'access_token' in st.session_state:
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             sym_short = s.replace("NSE:", "")
             
-            # Accurate real-time Kite % calculation, falling back on parsed GSheet value
             if cl > 0:
                 pct = round(((ltp - cl) / cl) * 100, 2)
             elif sym_short in gsheet_pct_map:
@@ -420,7 +417,6 @@ if 'access_token' in st.session_state:
             
             avg_v = avg_vols.get(s, 0)
             
-            # Dual Volume Threshold Logic
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
             
@@ -434,7 +430,6 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # Signal conditions
             is_happy_breakout = is_vol_break_500k and is_dc_breakout
             is_early_alert = is_vol_break_100k and (not is_vol_break_500k) and is_dc_breakout
 
@@ -456,7 +451,6 @@ if 'access_token' in st.session_state:
                         sl1_val = round(ltp - (1.5 * atr_val), 2)
                         sl2_val = fetch_pivot_s1(st.session_state.kite, q['instrument_token'])
                         
-                        # Store in persistent background tracking list for EMA dynamic exits
                         active_trades = load_active_trades()
                         active_trades[sym_short] = {
                             "instrument_token": q['instrument_token'],
@@ -480,6 +474,7 @@ if 'access_token' in st.session_state:
 
             vol_status_label = "🚀 BREAKOUT" if is_vol_break_500k else ("👀 WATCH (100K)" if is_vol_break_100k else "Normal")
 
+            # Clean output structure: Stock symbol is passed without color HTML or formatting tags
             results.append({
                 "Symbol": sym_short, 
                 "LTP": ltp, 
@@ -491,7 +486,6 @@ if 'access_token' in st.session_state:
         except Exception:
             continue
 
-    # Process background 15m EMA Candle-Close Exit Alerts
     if market_active:
         process_active_trade_exits(st.session_state.kite, st.session_state.access_token, API_KEY)
 
