@@ -1,6 +1,6 @@
 streamlit
 pandas
-pandas-ta
+numpy
 kiteconnect
 st-gsheets-connection
 pytz
