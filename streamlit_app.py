@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from kiteconnect import KiteConnect
 from streamlit_gsheets import GSheetsConnection
 import streamlit.components.v1 as components
 import time
 import os
+import json
 import pytz
 import requests
 from datetime import datetime, timedelta, time as dtime
@@ -42,131 +42,184 @@ except Exception as e:
     st.error(f"Setup Error: {e}")
     st.stop()
 
-# --- 2. MULTI-TIMEFRAME CANDLE FETCHERS & NATIVE RSI/EMA LOGIC ---
+ACTIVE_TRADES_FILE = "active_trades.json"
+
+# --- PERSISTENT ACTIVE TRADES STORAGE UTILS ---
+def load_active_trades():
+    if os.path.exists(ACTIVE_TRADES_FILE):
+        try:
+            with open(ACTIVE_TRADES_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_active_trades(trades):
+    try:
+        with open(ACTIVE_TRADES_FILE, "w") as f:
+            json.dump(trades, f, indent=4)
+    except Exception:
+        pass
+
+# --- TECHNICAL HELPERS: ATR, PIVOT S1, RSI & EMA ---
+def calculate_rsi_and_ema(series, period=14, ema_period=34):
+    if len(series) < period + 1:
+        return 0.0, 0.0
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi_series = 100 - (100 / (1 + rs))
+    rsi_series = rsi_series.fillna(0.0)
+    
+    if len(rsi_series) < ema_period:
+        return float(rsi_series.iloc[-1]), 0.0
+        
+    rsi_ema_series = rsi_series.ewm(span=ema_period, adjust=False).mean()
+    return float(rsi_series.iloc[-1]), float(rsi_ema_series.iloc[-1])
+
+def calculate_atr14(df):
+    if df is None or len(df) < 15:
+        return 0.0
+    df = df.copy()
+    df['prev_close'] = df['close'].shift(1)
+    df['tr'] = df.apply(
+        lambda r: max(
+            r['high'] - r['low'],
+            abs(r['high'] - r['prev_close']) if pd.notna(r['prev_close']) else 0.0,
+            abs(r['low'] - r['prev_close']) if pd.notna(r['prev_close']) else 0.0
+        ), axis=1
+    )
+    atr = df['tr'].rolling(window=14).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) else 0.0
+
+def fetch_pivot_s1(kite_inst, instrument_token):
+    try:
+        now = datetime.now(IST)
+        from_date = now - timedelta(days=5)
+        hist = kite_inst.historical_data(instrument_token, from_date, now.date() - timedelta(days=1), "day")
+        if not hist or len(hist) < 1:
+            return 0.0
+        prev_day = hist[-1]
+        p = (prev_day['high'] + prev_day['low'] + prev_day['close']) / 3.0
+        s1 = (2 * p) - prev_day['high']
+        return round(float(s1), 2)
+    except Exception:
+        return 0.0
+
+# --- 5-STAR CONDITION CALCULATOR ENGINE ---
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_candles(access_token, api_key, instrument_token, interval, days_back):
-    """Generic multi-timeframe candle fetcher."""
+def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
     try:
         kite_inst = KiteConnect(api_key=api_key)
         kite_inst.set_access_token(access_token)
         now = datetime.now(IST)
-        hist = kite_inst.historical_data(instrument_token, now - timedelta(days=days_back), now, interval)
-        if not hist:
-            return None
-        return pd.DataFrame(hist)
-    except Exception:
-        return None
-
-def calculate_rsi_with_ema(df, rsi_length=14, ema_length=34):
-    """Native RSI and EMA signal line calculation without external libraries."""
-    if df is None or len(df) < (rsi_length + ema_length + 5):
-        return None, None
-    
-    df = df.copy()
-    delta = df['close'].diff()
-    
-    # Wilder's Smoothing for RSI
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    
-    avg_gain = gain.ewm(alpha=1/rsi_length, min_periods=rsi_length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/rsi_length, min_periods=rsi_length, adjust=False).mean()
-    
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi_series = 100 - (100 / (1 + rs))
-    
-    # EMA of RSI
-    rsi_ema_series = rsi_series.ewm(span=ema_length, adjust=False).mean()
-
-    curr_rsi = rsi_series.iloc[-1]
-    curr_ema = rsi_ema_series.iloc[-1]
-    
-    return curr_rsi, curr_ema
-
-def check_rsi_condition(df, threshold):
-    """Checks if current RSI >= threshold OR holds above its EMA(34) signal line."""
-    curr_rsi, curr_ema = calculate_rsi_with_ema(df)
-    
-    if curr_rsi is None or pd.isna(curr_rsi):
-        return False
-    if curr_ema is None or pd.isna(curr_ema):
-        return curr_rsi >= threshold
         
-    return (curr_rsi >= threshold) or (curr_rsi > curr_ema)
+        hist_15m = kite_inst.historical_data(instrument_token, now - timedelta(days=10), now, "15minute")
+        hist_1h = kite_inst.historical_data(instrument_token, now - timedelta(days=30), now, "60minute")
+        hist_day = kite_inst.historical_data(instrument_token, now - timedelta(days=100), now, "day")
+        hist_week = kite_inst.historical_data(instrument_token, now - timedelta(days=365), now, "week")
+        
+        return (
+            pd.DataFrame(hist_15m) if hist_15m else None,
+            pd.DataFrame(hist_1h) if hist_1h else None,
+            pd.DataFrame(hist_day) if hist_day else None,
+            pd.DataFrame(hist_week) if hist_week else None
+        )
+    except Exception:
+        return None, None, None, None
 
-def generate_star_scorecard(access_token, api_key, instrument_token):
-    """
-    Evaluates 5 Multi-Timeframe conditions:
-    Star 1: 15m RVOL >= 2.5x SMA(20)
-    Star 2: 15m RSI >= 70 OR > EMA34
-    Star 3: 1h RSI >= 70 OR > EMA34
-    Star 4: Daily RSI >= 50 OR > EMA34
-    Star 5: Weekly RSI >= 50 OR > EMA34
-    """
-    stars = []
+def calculate_5star_score(df_15m, df_1h, df_day, df_week):
+    score = 0
     
-    df_15m = fetch_candles(access_token, api_key, instrument_token, "15minute", days_back=10)
-    df_1h = fetch_candles(access_token, api_key, instrument_token, "60minute", days_back=30)
-    df_daily = fetch_candles(access_token, api_key, instrument_token, "day", days_back=100)
-    df_weekly = fetch_candles(access_token, api_key, instrument_token, "weekly", days_back=300)
-    
-    # Star 1: 15m RVOL
+    # Star 1: 15m RVOL >= 2.5x SMA(20)
     if df_15m is not None and len(df_15m) >= 20:
-        df_15m['vol_sma20'] = df_15m['volume'].rolling(20).mean()
         curr_vol = df_15m['volume'].iloc[-1]
-        sma_vol = df_15m['vol_sma20'].iloc[-1]
-        rvol = (curr_vol / sma_vol) if (sma_vol and sma_vol > 0) else 0
-        stars.append('⭐' if rvol >= 2.5 else '☆')
-    else:
-        stars.append('☆')
+        vol_sma20 = df_15m['volume'].rolling(window=20).mean().iloc[-1]
+        if vol_sma20 > 0 and (curr_vol >= 2.5 * vol_sma20):
+            score += 1
 
-    # Star 2: 15m RSI
-    stars.append('⭐' if check_rsi_condition(df_15m, threshold=70) else '☆')
-    
-    # Star 3: 1h RSI
-    stars.append('⭐' if check_rsi_condition(df_1h, threshold=70) else '☆')
-    
-    # Star 4: Daily RSI
-    stars.append('⭐' if check_rsi_condition(df_daily, threshold=50) else '☆')
-    
-    # Star 5: Weekly RSI
-    stars.append('⭐' if check_rsi_condition(df_weekly, threshold=50) else '☆')
+    # Star 2: 15m RSI >= 70 OR RSI > EMA(34)
+    if df_15m is not None and len(df_15m) >= 34:
+        rsi_15m, ema_15m = calculate_rsi_and_ema(df_15m['close'])
+        if rsi_15m >= 70 or rsi_15m > ema_15m:
+            score += 1
 
-    return "".join(stars), df_15m
+    # Star 3: 1h RSI >= 70 OR RSI > EMA(34)
+    if df_1h is not None and len(df_1h) >= 34:
+        rsi_1h, ema_1h = calculate_rsi_and_ema(df_1h['close'])
+        if rsi_1h >= 70 or rsi_1h > ema_1h:
+            score += 1
 
-# --- 3. PC & TELEGRAM NOTIFICATION ENGINE ---
-def send_telegram_alert(symbol, alert_type, ltp, star_rating=""):
+    # Star 4: Daily RSI >= 50 OR RSI > EMA(34)
+    if df_day is not None and len(df_day) >= 34:
+        rsi_day, ema_day = calculate_rsi_and_ema(df_day['close'])
+        if rsi_day >= 50 or rsi_day > ema_day:
+            score += 1
+
+    # Star 5: Weekly RSI >= 50 OR RSI > EMA(34)
+    if df_week is not None and len(df_week) >= 34:
+        rsi_wk, ema_wk = calculate_rsi_and_ema(df_week['close'])
+        if rsi_wk >= 50 or rsi_wk > ema_wk:
+            score += 1
+
+    return f"{score}/5"
+
+# --- 2. PC & TELEGRAM NOTIFICATION ENGINE ---
+def send_telegram_raw(message):
     try:
         bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
-        
-        tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-        score_display = f"\n*Score:* `{star_rating}`" if star_rating else ""
-
-        message = (
-            f"🚀 *{alert_type.upper()} ALERT*\n\n"
-            f"*Symbol:* `{symbol}`\n"
-            f"*LTP:* ₹{ltp}{score_display}\n"
-            f"📈 [Open Chart]({tv_url})"
-        )
-        
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": message,
-            "parse_mode": "Markdown",
             "disable_web_page_preview": True
         }
         requests.post(url, data=payload, timeout=5)
     except Exception:
         pass
 
-def trigger_alert(symbol, alert_type, ltp, star_rating=""):
+def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url=""):
+    if alert_type == "Happy Breakout":
+        message = (
+            f"HAPPY BREAKOUT: {symbol}\n\n"
+            f"Entry: ₹{ltp}\n"
+            f"Score: {score}\n"
+            f"SL 1: ₹{sl1}\n"
+            f"SL 2: ₹{sl2}\n\n"
+            f"Open Chart: {chart_url}"
+        )
+    else:
+        message = (
+            f"{alert_type.upper()}: {symbol}\n\n"
+            f"Entry: ₹{ltp}\n"
+            f"Score: {score}\n\n"
+            f"Open Chart: {chart_url}"
+        )
+    send_telegram_raw(message)
+
+def send_telegram_exit(symbol, exit_type, ltp, chart_url=""):
+    message = (
+        f"{exit_type}: {symbol}\n\n"
+        f"LTP: ₹{ltp}\n"
+        f"Open Chart: {chart_url}"
+    )
+    send_telegram_raw(message)
+
+def send_telegram_eod_exit(symbols):
+    if not symbols:
+        return
+    sym_list = ", ".join(symbols)
+    message = f"EXIT FULL POSITION: {sym_list}"
+    send_telegram_raw(message)
+
+def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url=""):
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
-        const n = new Notification("{alert_type} ALERT: {symbol}", {{ 
-            body: "Price: {ltp} | Score: {star_rating}",
+        const n = new Notification("{alert_type}: {symbol} (Score: {score})", {{ 
+            body: "Price: {ltp}",
             icon: "https://kite.zerodha.com/static/images/kite-logo.svg" 
         }});
         new Audio('https://media.geeksforgeeks.org/wp-content/uploads/20190531135120/beep.mp3').play();
@@ -175,11 +228,11 @@ def trigger_alert(symbol, alert_type, ltp, star_rating=""):
     </script>
     """
     components.html(notification_js, height=0)
-    st.toast(f"{alert_type}: {symbol} ({star_rating})", icon="🚀")
+    st.toast(f"{alert_type}: {symbol} (Score: {score})", icon="🚀")
     
-    send_telegram_alert(symbol, alert_type, ltp, star_rating)
+    send_telegram_alert(symbol, alert_type, ltp, sl1=sl1, sl2=sl2, score=score, chart_url=chart_url)
 
-# --- 4. SESSION STATE ---
+# --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
     st.session_state.kite = KiteConnect(api_key=API_KEY)
 if 'alerts_history' not in st.session_state:
@@ -195,7 +248,7 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
     except Exception:
         pass
 
-# --- 5. DONCHIAN CHANNEL & CACHED HISTORICAL DATA ---
+# --- 4. DONCHIAN CHANNEL & CACHED HISTORICAL DATA ---
 def get_donchian_status(df, length=28, offset=6):
     if df is None or len(df) < (length + offset):
         return "N/A", False
@@ -210,6 +263,17 @@ def get_donchian_status(df, length=28, offset=6):
     is_breakout = curr_close >= curr_upper
     status_str = "🚀 UPPER BREAKOUT" if is_breakout else "Below"
     return status_str, is_breakout
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_15m_candles(access_token, api_key, instrument_token):
+    try:
+        kite_inst = KiteConnect(api_key=api_key)
+        kite_inst.set_access_token(access_token)
+        now = datetime.now(IST)
+        hist = kite_inst.historical_data(instrument_token, now - timedelta(days=10), now, "15minute")
+        return pd.DataFrame(hist)
+    except Exception:
+        return None
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_daily_avg_vol(access_token, api_key, symbols):
@@ -237,7 +301,7 @@ def get_daily_avg_vol(access_token, api_key, symbols):
             pass
     return avg_vol_map
 
-# --- 6. MARKET HOURS UTILITY ---
+# --- 5. MARKET HOURS UTILITY ---
 def is_market_open():
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -246,7 +310,69 @@ def is_market_open():
     market_end = dtime(15, 30)
     return market_start <= now.time() <= market_end
 
-# --- 7. SIDEBAR ---
+# --- Dynamic EMA Exit Monitor Engine ---
+def process_active_trade_exits(kite_inst, access_token, api_key):
+    now_time = datetime.now(IST).time()
+    active_trades = load_active_trades()
+    if not active_trades:
+        return
+
+    # 3:15 PM EOD Consolidated Square-Off Trigger
+    if now_time >= dtime(15, 15):
+        eod_exit_symbols = []
+        for sym, data in list(active_trades.items()):
+            trig_dt = datetime.fromisoformat(data["trigger_time"])
+            # Evaluate trades triggered before 3:15 PM today
+            if trig_dt.time() <= dtime(15, 15):
+                eod_exit_symbols.append(sym)
+                del active_trades[sym]
+            else:
+                # Late triggers (> 3:15 PM) saved cleanly for next session watchlist
+                data["watchlist_next_session"] = True
+
+        if eod_exit_symbols:
+            send_telegram_eod_exit(eod_exit_symbols)
+        save_active_trades(active_trades)
+        return
+
+    # Regular intraday 15m candle-close check
+    updated = False
+    for sym, data in list(active_trades.items()):
+        inst_token = data.get("instrument_token")
+        if not inst_token:
+            continue
+
+        df_15m = fetch_15m_candles(access_token, api_key, inst_token)
+        if df_15m is None or len(df_15m) < 15:
+            continue
+
+        df_15m['ema5'] = df_15m['close'].ewm(span=5, adjust=False).mean()
+        df_15m['ema9'] = df_15m['close'].ewm(span=9, adjust=False).mean()
+
+        last_close = df_15m['close'].iloc[-1]
+        last_ema5 = df_15m['ema5'].iloc[-1]
+        last_ema9 = df_15m['ema9'].iloc[-1]
+        tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
+
+        # EXIT 1: 15m Candle Close Below 5 EMA
+        if not data.get("exit1_triggered", False):
+            if last_close < last_ema5:
+                send_telegram_exit(sym, "EXIT 1", round(last_close, 2), chart_url=tv_url)
+                data["exit1_triggered"] = True
+                updated = True
+
+        # FINAL EXIT: 15m Candle Close Below 9 EMA
+        if not data.get("final_exit_triggered", False):
+            if last_close < last_ema9:
+                send_telegram_exit(sym, "FINAL EXIT", round(last_close, 2), chart_url=tv_url)
+                data["final_exit_triggered"] = True
+                del active_trades[sym]
+                updated = True
+
+    if updated:
+        save_active_trades(active_trades)
+
+# --- 6. SIDEBAR ---
 with st.sidebar:
     st.header("🕒 Scanner Status")
     now_ist = datetime.now(IST)
@@ -290,7 +416,7 @@ with st.sidebar:
             st.session_state.clear()
             st.rerun()
 
-# --- 8. MAIN DATA PROCESSING ---
+# --- 7. MAIN DATA PROCESSING ---
 if 'access_token' in st.session_state:
     sheets = ["Scanner_Output 1", "Scanner_Output 2", "Scanner_Output 3", "Indices", "GF_Scanner"]
     all_syms = []
@@ -363,8 +489,8 @@ if 'access_token' in st.session_state:
             
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             sym_short = s.replace("NSE:", "")
-            inst_token = q['instrument_token']
             
+            # Accurate real-time Kite % calculation, falling back on parsed GSheet value
             if cl > 0:
                 pct = round(((ltp - cl) / cl) * 100, 2)
             elif sym_short in gsheet_pct_map:
@@ -374,19 +500,23 @@ if 'access_token' in st.session_state:
             
             avg_v = avg_vols.get(s, 0)
             
+            # Dual Volume Threshold Logic
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
             
+            # Multi-timeframe fetch & 5-Star score calculation
+            df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
+            star_score = calculate_5star_score(df_15m, df_1h, df_day, df_week)
+            
             if show_all_stocks or pct >= 1.0 or is_vol_break_100k:
-                star_rating, df_15m = generate_star_scorecard(st.session_state.access_token, API_KEY, inst_token)
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
             else:
-                star_rating = "☆☆☆☆☆"
                 dc_status, is_dc_breakout = "Below", False
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
+            # Signal conditions
             is_happy_breakout = is_vol_break_500k and is_dc_breakout
             is_early_alert = is_vol_break_100k and (not is_vol_break_500k) and is_dc_breakout
 
@@ -402,11 +532,30 @@ if 'access_token' in st.session_state:
                     alert_type = "Donchian Upper 15m"
                 
                 if alert_type:
-                    trigger_alert(sym_short, alert_type, ltp, star_rating)
+                    sl1_val, sl2_val = 0.0, 0.0
+                    if alert_type == "Happy Breakout":
+                        atr_val = calculate_atr14(df_15m)
+                        sl1_val = round(ltp - (1.5 * atr_val), 2)
+                        sl2_val = fetch_pivot_s1(st.session_state.kite, q['instrument_token'])
+                        
+                        # Store in persistent background tracking list for EMA dynamic exits
+                        active_trades = load_active_trades()
+                        active_trades[sym_short] = {
+                            "instrument_token": q['instrument_token'],
+                            "entry_price": ltp,
+                            "sl1": sl1_val,
+                            "sl2": sl2_val,
+                            "trigger_time": datetime.now(IST).isoformat(),
+                            "exit1_triggered": False,
+                            "final_exit_triggered": False
+                        }
+                        save_active_trades(active_trades)
+
+                    trigger_alert(sym_short, alert_type, ltp, sl1=sl1_val, sl2=sl2_val, score=star_score, chart_url=tv_url)
                     st.session_state.alerts_history.append({
                         "Symbol": sym_short, 
                         "Type": alert_type, 
-                        "Score": star_rating,
+                        "Score": star_score,
                         "Time": now_ist.strftime("%H:%M:%S"), 
                         "LTP": ltp, 
                         "Chart": tv_url
@@ -416,15 +565,19 @@ if 'access_token' in st.session_state:
 
             results.append({
                 "Symbol": sym_short, 
+                "Score": star_score,
                 "LTP": ltp, 
                 "Change %": pct, 
                 "Vol Status": vol_status_label, 
                 "Donchian 15m (28,6)": dc_status, 
-                "Chart": tv_url,
-                "Score": star_rating
+                "Chart": tv_url
             })
         except Exception:
             continue
+
+    # Process background 15m EMA Candle-Close Exit Alerts
+    if market_active:
+        process_active_trade_exits(st.session_state.kite, st.session_state.access_token, API_KEY)
 
     try:
         df_sheet_log = conn.read(worksheet="Alert_Log")
@@ -438,7 +591,7 @@ if 'access_token' in st.session_state:
         df_sheet_log = pd.DataFrame()
         sheet_log_count = 0
 
-    # --- 9. DASHBOARD DISPLAY ---
+    # --- 8. DASHBOARD DISPLAY ---
     if results:
         df_full = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
         df_display = df_full if show_all_stocks else df_full[df_full['Change %'] >= 1.0]
