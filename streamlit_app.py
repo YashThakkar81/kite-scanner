@@ -42,10 +42,10 @@ except Exception as e:
     st.error(f"Setup Error: {e}")
     st.stop()
 
-# --- 2. MULTI-TIMEFRAME CANDLE FETCHERS & RSI STAR LOGIC ---
+# --- 2. MULTI-TIMEFRAME CANDLE FETCHERS & 5-STAR LOGIC ---
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_candles(access_token, api_key, instrument_token, interval, days_back):
-    """Generic fetcher for historical candles across timeframes."""
+    """Generic multi-timeframe candle fetcher."""
     try:
         kite_inst = KiteConnect(api_key=api_key)
         kite_inst.set_access_token(access_token)
@@ -58,9 +58,7 @@ def fetch_candles(access_token, api_key, instrument_token, interval, days_back):
         return None
 
 def calculate_rsi_with_ema(df, rsi_length=14, ema_length=34):
-    """
-    Calculates RSI(14) and its EMA(34) signal line matching ChartIQ/TradingView parameters.
-    """
+    """Calculates RSI(14) and EMA(34) signal line on RSI."""
     if df is None or len(df) < (rsi_length + ema_length + 5):
         return None, None
     
@@ -79,9 +77,7 @@ def calculate_rsi_with_ema(df, rsi_length=14, ema_length=34):
     return curr_rsi, curr_ema
 
 def check_rsi_condition(df, threshold):
-    """
-    Checks if current RSI meets fixed threshold OR holds above EMA 34 smoothing line.
-    """
+    """Checks if current RSI >= threshold OR holds above its EMA(34) signal line."""
     curr_rsi, curr_ema = calculate_rsi_with_ema(df)
     
     if curr_rsi is None or pd.isna(curr_rsi):
@@ -138,18 +134,12 @@ def send_telegram_alert(symbol, alert_type, ltp, star_rating=""):
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
         
         tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
-        
-        is_entry_alert = any(keyword in alert_type.upper() for keyword in ["HAPPY", "EARLY", "BREAKOUT", "DONCHIAN", "WATCHLIST"])
-        
-        if is_entry_alert and star_rating:
-            header_str = f"{star_rating}\n{alert_type.upper()} - {symbol}"
-        else:
-            header_str = f"🚀 *{alert_type.upper()} ALERT*"
+        score_display = f"\n*Score:* `{star_rating}`" if star_rating else ""
 
         message = (
-            f"{header_str}\n\n"
+            f"🚀 *{alert_type.upper()} ALERT*\n\n"
             f"*Symbol:* `{symbol}`\n"
-            f"*LTP:* ₹{ltp}\n"
+            f"*LTP:* ₹{ltp}{score_display}\n"
             f"📈 [Open Chart]({tv_url})"
         )
         
@@ -412,7 +402,7 @@ if 'access_token' in st.session_state:
                     st.session_state.alerts_history.append({
                         "Symbol": sym_short, 
                         "Type": alert_type, 
-                        "Stars": star_rating,
+                        "Score": star_rating,
                         "Time": now_ist.strftime("%H:%M:%S"), 
                         "LTP": ltp, 
                         "Chart": tv_url
@@ -422,12 +412,12 @@ if 'access_token' in st.session_state:
 
             results.append({
                 "Symbol": sym_short, 
-                "Score": star_rating,
                 "LTP": ltp, 
                 "Change %": pct, 
                 "Vol Status": vol_status_label, 
                 "Donchian 15m (28,6)": dc_status, 
-                "Chart": tv_url
+                "Chart": tv_url,
+                "Score": star_rating
             })
         except Exception:
             continue
