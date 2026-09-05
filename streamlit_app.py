@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 from kiteconnect import KiteConnect
 from streamlit_gsheets import GSheetsConnection
 import streamlit.components.v1 as components
@@ -42,7 +42,7 @@ except Exception as e:
     st.error(f"Setup Error: {e}")
     st.stop()
 
-# --- 2. MULTI-TIMEFRAME CANDLE FETCHERS & 5-STAR LOGIC ---
+# --- 2. MULTI-TIMEFRAME CANDLE FETCHERS & NATIVE RSI/EMA LOGIC ---
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_candles(access_token, api_key, instrument_token, interval, days_back):
     """Generic multi-timeframe candle fetcher."""
@@ -58,18 +58,25 @@ def fetch_candles(access_token, api_key, instrument_token, interval, days_back):
         return None
 
 def calculate_rsi_with_ema(df, rsi_length=14, ema_length=34):
-    """Calculates RSI(14) and EMA(34) signal line on RSI."""
+    """Native RSI and EMA signal line calculation without external libraries."""
     if df is None or len(df) < (rsi_length + ema_length + 5):
         return None, None
     
     df = df.copy()
-    rsi_series = ta.rsi(df['close'], length=rsi_length)
-    if rsi_series is None or rsi_series.empty:
-        return None, None
+    delta = df['close'].diff()
     
-    rsi_ema_series = ta.ema(rsi_series, length=ema_length)
-    if rsi_ema_series is None or rsi_ema_series.empty:
-        return None, None
+    # Wilder's Smoothing for RSI
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+    
+    avg_gain = gain.ewm(alpha=1/rsi_length, min_periods=rsi_length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/rsi_length, min_periods=rsi_length, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi_series = 100 - (100 / (1 + rs))
+    
+    # EMA of RSI
+    rsi_ema_series = rsi_series.ewm(span=ema_length, adjust=False).mean()
 
     curr_rsi = rsi_series.iloc[-1]
     curr_ema = rsi_ema_series.iloc[-1]
@@ -358,7 +365,6 @@ if 'access_token' in st.session_state:
             sym_short = s.replace("NSE:", "")
             inst_token = q['instrument_token']
             
-            # Accurate real-time Kite % calculation, falling back on parsed GSheet value
             if cl > 0:
                 pct = round(((ltp - cl) / cl) * 100, 2)
             elif sym_short in gsheet_pct_map:
@@ -368,7 +374,6 @@ if 'access_token' in st.session_state:
             
             avg_v = avg_vols.get(s, 0)
             
-            # Dual Volume Threshold Logic
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
             
@@ -382,7 +387,6 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
-            # Signal conditions
             is_happy_breakout = is_vol_break_500k and is_dc_breakout
             is_early_alert = is_vol_break_100k and (not is_vol_break_500k) and is_dc_breakout
 
