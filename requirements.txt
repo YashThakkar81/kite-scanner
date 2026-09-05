@@ -1,6 +1,7 @@
 streamlit
-kiteconnect
 pandas
+pandas-ta
+kiteconnect
 st-gsheets-connection
 pytz
 requests
