@@ -9,6 +9,7 @@ import json
 import pytz
 import requests
 from datetime import datetime, timedelta, time as dtime
+from concurrent.futures import ThreadPoolExecutor
 
 # --- 1. CONFIGURATION & BLUE TOGGLE + TOOLTIP STYLING ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
@@ -155,7 +156,7 @@ def fetch_pivot_s1(kite_inst, instrument_token):
     except Exception:
         return 0.0
 
-# --- 5-STAR CONDITION CALCULATOR ENGINE ---
+# --- FAST MULTI-TIMEFRAME CANDLE FETCHING WITH THREADING ---
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
     try:
@@ -163,10 +164,22 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
         kite_inst.set_access_token(access_token)
         now = datetime.now(IST)
         
-        hist_15m = kite_inst.historical_data(instrument_token, now - timedelta(days=10), now, "15minute")
-        hist_1h = kite_inst.historical_data(instrument_token, now - timedelta(days=30), now, "60minute")
-        hist_day = kite_inst.historical_data(instrument_token, now - timedelta(days=100), now, "day")
-        hist_week = kite_inst.historical_data(instrument_token, now - timedelta(days=365), now, "week")
+        def fetch_tf(interval, days):
+            try:
+                return kite_inst.historical_data(instrument_token, now - timedelta(days=days), now, interval)
+            except Exception:
+                return []
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            f_15m = executor.submit(fetch_tf, "15minute", 10)
+            f_1h = executor.submit(fetch_tf, "60minute", 30)
+            f_day = executor.submit(fetch_tf, "day", 100)
+            f_week = executor.submit(fetch_tf, "week", 365)
+            
+            hist_15m = f_15m.result()
+            hist_1h = f_1h.result()
+            hist_day = f_day.result()
+            hist_week = f_week.result()
         
         return (
             pd.DataFrame(hist_15m) if hist_15m else None,
@@ -335,21 +348,25 @@ def get_daily_avg_vol(access_token, api_key, symbols):
     avg_vol_map = {}
     to_date = datetime.now(IST).date()
     from_date = to_date - timedelta(days=35)
-    
+
+    def process_symbol(s, q):
+        try:
+            if q:
+                hist = kite_inst.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
+                return s, sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
+            return s, 999999999
+        except Exception:
+            return s, 999999999
+
     for i in range(0, len(symbols), 100):
         chunk = symbols[i:i+100]
         try:
             quotes = kite_inst.quote(chunk)
-            for s in chunk:
-                try:
-                    q = quotes.get(s)
-                    if q:
-                        hist = kite_inst.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
-                        avg_vol_map[s] = sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
-                    else:
-                        avg_vol_map[s] = 999999999
-                except Exception:
-                    avg_vol_map[s] = 999999999
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(process_symbol, s, quotes.get(s)) for s in chunk]
+                for f in futures:
+                    sym, vol_val = f.result()
+                    avg_vol_map[sym] = vol_val
         except Exception:
             pass
     return avg_vol_map
@@ -370,7 +387,6 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
     if not active_trades:
         return
 
-    # 3:15 PM EOD Consolidated Square-Off Trigger
     if now_time >= dtime(15, 15):
         eod_exit_symbols = []
         for sym, data in list(active_trades.items()):
@@ -386,7 +402,6 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
         save_active_trades(active_trades)
         return
 
-    # Regular intraday 15m candle-close check
     updated = False
     for sym, data in list(active_trades.items()):
         inst_token = data.get("instrument_token")
@@ -405,14 +420,12 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
         last_ema9 = df_15m['ema9'].iloc[-1]
         tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
 
-        # EXIT 1: 15m Candle Close Below 5 EMA
         if not data.get("exit1_triggered", False):
             if last_close < last_ema5:
                 send_telegram_exit(sym, "EXIT 1", round(last_close, 2), chart_url=tv_url)
                 data["exit1_triggered"] = True
                 updated = True
 
-        # FINAL EXIT: 15m Candle Close Below 9 EMA
         if not data.get("final_exit_triggered", False):
             if last_close < last_ema9:
                 send_telegram_exit(sym, "FINAL EXIT", round(last_close, 2), chart_url=tv_url)
@@ -553,12 +566,16 @@ if 'access_token' in st.session_state:
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
             
-            df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
-            star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week)
+            # LAZY EVALUATION: Skip historical fetch if stock doesn't meet minimum criteria
+            should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k
             
-            if show_all_stocks or pct >= 1.0 or is_vol_break_100k:
+            if should_evaluate:
+                df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
+                star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week)
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
             else:
+                star_score_plain, star_score_html = "0/5", "0/5"
+                df_15m = None
                 dc_status, is_dc_breakout = "Below", False
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
