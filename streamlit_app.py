@@ -21,7 +21,7 @@ st.markdown("""
     [data-testid="stHeader"] th { text-align: center !important; }
     [data-testid="stDataFrame"] a { justify-content: center !important; }
     .stDataFrame { margin: 0 auto; }
-    
+
     /* Blue Toggle Switch Styling */
     span[aria-checked="true"] {
         background-color: #1E88E5 !important;
@@ -81,7 +81,7 @@ st.markdown("""
         font-weight: bold;
     }
     </style>
-    """, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 try:
     API_KEY = st.secrets["API_KEY"]
@@ -110,7 +110,7 @@ def save_active_trades(trades):
     except Exception:
         pass
 
-# --- TECHNICAL HELPERS: ATR, PIVOT S1, RSI & EMA ---
+# --- TECHNICAL HELPERS: ATR, PIVOT S1, RSI, EMA & VOLUME OSCILLATOR ---
 def calculate_rsi_and_ema(series, period=14, ema_period=34):
     if len(series) < period + 1:
         return 0.0, 0.0
@@ -120,10 +120,10 @@ def calculate_rsi_and_ema(series, period=14, ema_period=34):
     rs = gain / loss
     rsi_series = 100 - (100 / (1 + rs))
     rsi_series = rsi_series.fillna(0.0)
-    
+
     if len(rsi_series) < ema_period:
         return float(rsi_series.iloc[-1]), 0.0
-        
+
     rsi_ema_series = rsi_series.ewm(span=ema_period, adjust=False).mean()
     return float(rsi_series.iloc[-1]), float(rsi_ema_series.iloc[-1])
 
@@ -156,6 +156,24 @@ def fetch_pivot_s1(kite_inst, instrument_token):
     except Exception:
         return 0.0
 
+# --- TRADINGVIEW VOLUME OSCILLATOR (Shortlen = 1, Longlen = 20) ---
+def calculate_volume_oscillator(df, short_len=1, long_len=20):
+    if df is None or len(df) < long_len:
+        return 0.0
+    
+    vol_series = df['volume'].astype(float)
+    short_ema = vol_series.ewm(span=short_len, adjust=False).mean()
+    long_ema = vol_series.ewm(span=long_len, adjust=False).mean()
+    
+    last_short = short_ema.iloc[-1]
+    last_long = long_ema.iloc[-1]
+    
+    if last_long == 0:
+        return 0.0
+        
+    vo = ((last_short - last_long) / last_long) * 100.0
+    return round(float(vo), 2)
+
 # --- FAST MULTI-TIMEFRAME CANDLE FETCHING WITH THREADING ---
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
@@ -163,7 +181,7 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
         kite_inst = KiteConnect(api_key=api_key)
         kite_inst.set_access_token(access_token)
         now = datetime.now(IST)
-        
+
         def fetch_tf(interval, days):
             try:
                 return kite_inst.historical_data(instrument_token, now - timedelta(days=days), now, interval)
@@ -175,12 +193,12 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
             f_1h = executor.submit(fetch_tf, "60minute", 30)
             f_day = executor.submit(fetch_tf, "day", 100)
             f_week = executor.submit(fetch_tf, "week", 365)
-            
+
             hist_15m = f_15m.result()
             hist_1h = f_1h.result()
             hist_day = f_day.result()
             hist_week = f_week.result()
-        
+
         return (
             pd.DataFrame(hist_15m) if hist_15m else None,
             pd.DataFrame(hist_1h) if hist_1h else None,
@@ -190,7 +208,7 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
     except Exception:
         return None, None, None, None
 
-def calculate_5star_score(df_15m, df_1h, df_day, df_week):
+def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     c1, c2, c3, c4, c5 = False, False, False, False, False
 
     # Star 1: 15m RVOL >= 2.5x SMA(20)
@@ -227,7 +245,9 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week):
     score_num = sum([c1, c2, c3, c4, c5])
     score_plain = f"{score_num}/5"
 
-    html_tooltip = f"""<div class="score-tooltip">{score_num}/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">{"✅" if c1 else "❌"} 15m RVOL ≥ 2.5x<br>{"✅" if c2 else "❌"} 15m RSI ≥ 70 / >EMA34<br>{"✅" if c3 else "❌"} 1h RSI ≥ 70 / >EMA34<br>{"✅" if c4 else "❌"} Daily RSI ≥ 50 / >EMA34<br>{"✅" if c5 else "❌"} Weekly RSI ≥ 50 / >EMA34</div></div>"""
+    vo_str = f"{vol_osc_pct:+.2f}%" if vol_osc_pct is not None and pd.notna(vol_osc_pct) else "N/A"
+
+    html_tooltip = f"""<div class="score-tooltip">{score_num}/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">{"✅" if c1 else "❌"} 15m RVOL &ge; 2.5x<br>{"✅" if c2 else "❌"} 15m RSI Criteria<br>{"✅" if c3 else "❌"} 1h RSI Criteria<br>{"✅" if c4 else "❌"} Daily RSI Criteria<br>{"✅" if c5 else "❌"} Weekly RSI Criteria<br><hr style="margin:4px 0;"><span style="color:#FF9800; font-weight:bold;">Vol Osc: {vo_str}</span></div></div>"""
 
     return score_plain, html_tooltip
 
@@ -240,36 +260,43 @@ def send_telegram_raw(message):
         payload = {
             "chat_id": chat_id,
             "text": message,
+            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
         requests.post(url, data=payload, timeout=5)
     except Exception:
         pass
 
-def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url=""):
+def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url="", vo_val=None):
+    vo_str = f"{vo_val:+.2f}%" if vo_val is not None and pd.notna(vo_val) else "N/A"
+    chart_link = f'<a href="{chart_url}">Open TV ↗</a>' if chart_url else ""
+    
     if alert_type == "Happy Breakout":
         message = (
-            f"HAPPY BREAKOUT: {symbol}\n\n"
-            f"Entry: ₹{ltp}\n"
+            f"<b>HAPPY BREAKOUT: {symbol}</b>\n"
             f"Score: {score}\n"
+            f"VO: {vo_str}\n"
+            f"Entry: ₹{ltp}\n"
             f"SL 1: ₹{sl1}\n"
-            f"SL 2: ₹{sl2}\n\n"
-            f"Open Chart: {chart_url}"
+            f"SL 2: ₹{sl2}\n"
+            f"Chart: {chart_link}"
         )
     else:
         message = (
-            f"{alert_type.upper()}: {symbol}\n\n"
+            f"<b>{alert_type.upper()}: {symbol}</b>\n"
+            f"Score: {score}\n"
+            f"VO: {vo_str}\n"
             f"Entry: ₹{ltp}\n"
-            f"Score: {score}\n\n"
-            f"Open Chart: {chart_url}"
+            f"Chart: {chart_link}"
         )
     send_telegram_raw(message)
 
 def send_telegram_exit(symbol, exit_type, ltp, chart_url=""):
+    chart_link = f'<a href="{chart_url}">Open TV ↗</a>' if chart_url else ""
     message = (
-        f"{exit_type}: {symbol}\n\n"
+        f"<b>{exit_type}: {symbol}</b>\n"
         f"LTP: ₹{ltp}\n"
-        f"Open Chart: {chart_url}"
+        f"Chart: {chart_link}"
     )
     send_telegram_raw(message)
 
@@ -277,16 +304,16 @@ def send_telegram_eod_exit(symbols):
     if not symbols:
         return
     sym_list = ", ".join(symbols)
-    message = f"EXIT FULL POSITION: {sym_list}"
+    message = f"<b>EXIT FULL POSITION:</b> {sym_list}"
     send_telegram_raw(message)
 
-def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url=""):
+def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url="", vo_val=None):
     notification_js = f"""
     <script>
     if (Notification.permission === "granted") {{
-        const n = new Notification("{alert_type}: {symbol} (Score: {score})", {{ 
+        const n = new Notification("{alert_type}: {symbol} (Score: {score})", {{
             body: "Price: {ltp}",
-            icon: "https://kite.zerodha.com/static/images/kite-logo.svg" 
+            icon: "https://kite.zerodha.com/static/images/kite-logo.svg"
         }});
         new Audio('https://media.geeksforgeeks.org/wp-content/uploads/20190531135120/beep.mp3').play();
         setTimeout(() => n.close(), 5000);
@@ -296,7 +323,7 @@ def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol} (Score: {score})", icon="🚀")
     
-    send_telegram_alert(symbol, alert_type, ltp, sl1=sl1, sl2=sl2, score=score, chart_url=chart_url)
+    send_telegram_alert(symbol, alert_type, ltp, sl1=sl1, sl2=sl2, score=score, chart_url=chart_url, vo_val=vo_val)
 
 # --- 3. SESSION STATE ---
 if 'kite' not in st.session_state:
@@ -481,30 +508,33 @@ with st.sidebar:
             st.rerun()
 
 # --- 7. MAIN DATA PROCESSING ---
+sheet_log_count = 0
+df_sheet_log = pd.DataFrame()
+
 if 'access_token' in st.session_state:
     sheets = ["Scanner_Output 1", "Scanner_Output 2", "Scanner_Output 3", "Indices", "GF_Scanner"]
     all_syms = []
     gsheet_pct_map = {}
-    
+
     for ws in sheets:
         try:
             df_sheet = conn.read(worksheet=ws)
             if not df_sheet.empty:
                 syms_in_sheet = df_sheet.iloc[:, 0].dropna().astype(str).tolist()
                 all_syms.extend(syms_in_sheet)
-                
+
                 pct_col_idx = None
                 for idx, col_name in enumerate(df_sheet.columns):
                     if "%" in str(col_name) or "CHANGE" in str(col_name).upper():
                         pct_col_idx = idx
                         break
-                
+
                 for _, row in df_sheet.iterrows():
                     s_raw = str(row.iloc[0]).strip()
-                    if '="' in s_raw:
+                    if '=' in s_raw:
                         s_raw = s_raw.split('"')[1] if '"' in s_raw else s_raw
-                    s_clean = s_raw.replace('="', '').replace('"', '').strip().upper()
-                    
+                    s_clean = s_raw.replace('=', '').replace('"', '').strip().upper()
+
                     if s_clean and s_clean not in ['NAN', 'SYMBOL', 'INDEX']:
                         if pct_col_idx is not None:
                             val_str = str(row.iloc[pct_col_idx]).replace('%', '').strip()
@@ -517,19 +547,28 @@ if 'access_token' in st.session_state:
                                 pass
         except Exception:
             continue
-    
+
+    # READ GSHEET ALERT_LOG
+    try:
+        df_sheet_log = conn.read(worksheet="Alert_Log")
+        if not df_sheet_log.empty:
+            sheet_log_count = len(df_sheet_log)
+    except Exception:
+        df_sheet_log = pd.DataFrame()
+        sheet_log_count = 0
+
     clean_symbols = []
     for s in set(all_syms):
         s_str = str(s).strip()
-        if '="' in s_str:
+        if '=' in s_str:
             s_str = s_str.split('"')[1] if '"' in s_str else s_str
-        s_str = s_str.replace('="', '').replace('"', '').strip().upper()
+        s_str = s_str.replace('=', '').replace('"', '').strip().upper()
         if s_str and s_str not in ['NAN', 'SYMBOL', 'INDEX']:
             clean_symbols.append(s_str)
 
     symbols = ["NSE:" + s for s in clean_symbols]
     total_fetched_count = len(symbols)
-    
+
     if not symbols:
         st.warning("No symbols found across worksheets.")
         st.stop()
@@ -549,32 +588,35 @@ if 'access_token' in st.session_state:
     for s in symbols:
         try:
             q = full_quotes.get(s)
-            if not q: continue
-            
+            if not q:
+                continue
+
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
             sym_short = s.replace("NSE:", "")
-            
+
             if cl > 0:
                 pct = round(((ltp - cl) / cl) * 100, 2)
             elif sym_short in gsheet_pct_map:
                 pct = round(gsheet_pct_map[sym_short], 2)
             else:
                 pct = 0.0
-            
+
             avg_v = avg_vols.get(s, 0)
-            
-            is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol > 500000)
+
+            is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
-            
-            # LAZY EVALUATION: Skip historical fetch if stock doesn't meet minimum criteria
+
+            # LAZY EVALUATION
             should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k
-            
+
             if should_evaluate:
                 df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
-                star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week)
+                vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
+                star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
             else:
-                star_score_plain, star_score_html = "0/5", "0/5"
+                vol_osc_pct = 0.0
+                star_score_plain, star_score_html = "0/5", '<div class="score-tooltip">0/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">Not Evaluated</div></div>'
                 df_15m = None
                 dc_status, is_dc_breakout = "Below", False
 
@@ -594,139 +636,163 @@ if 'access_token' in st.session_state:
                     alert_type = "Volume Breakout"
                 elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
                     alert_type = "Donchian Upper 15m"
-                
-                if alert_type:
-                    sl1_val, sl2_val = 0.0, 0.0
-                    if alert_type == "Happy Breakout":
-                        atr_val = calculate_atr14(df_15m)
-                        sl1_val = round(ltp - (1.5 * atr_val), 2)
-                        sl2_val = fetch_pivot_s1(st.session_state.kite, q['instrument_token'])
-                        
-                        active_trades = load_active_trades()
-                        active_trades[sym_short] = {
-                            "instrument_token": q['instrument_token'],
-                            "entry_price": ltp,
-                            "sl1": sl1_val,
-                            "sl2": sl2_val,
-                            "trigger_time": datetime.now(IST).isoformat(),
-                            "exit1_triggered": False,
-                            "final_exit_triggered": False
-                        }
-                        save_active_trades(active_trades)
 
-                    trigger_alert(sym_short, alert_type, ltp, sl1=sl1_val, sl2=sl2_val, score=star_score_plain, chart_url=tv_url)
-                    st.session_state.alerts_history.append({
-                        "Symbol": sym_short, 
-                        "Type": alert_type, 
-                        "Score": star_score_plain,
-                        "Time": now_ist.strftime("%H:%M:%S"), 
-                        "LTP": ltp, 
-                        "Chart": tv_url
-                    })
+            if alert_type:
+                sl1_val, sl2_val = 0.0, 0.0
+                if alert_type == "Happy Breakout":
+                    atr_val = calculate_atr14(df_15m)
+                    sl1_val = round(ltp - (1.5 * atr_val), 2)
+                    sl2_val = fetch_pivot_s1(st.session_state.kite, q['instrument_token'])
+
+                active_trades = load_active_trades()
+                active_trades[sym_short] = {
+                    "instrument_token": q['instrument_token'],
+                    "entry_price": ltp,
+                    "sl1": sl1_val,
+                    "sl2": sl2_val,
+                    "trigger_time": datetime.now(IST).isoformat(),
+                    "exit1_triggered": False,
+                    "final_exit_triggered": False
+                }
+                save_active_trades(active_trades)
+
+                trigger_alert(sym_short, alert_type, ltp, sl1=sl1_val, sl2=sl2_val, score=star_score_plain, chart_url=tv_url, vo_val=vol_osc_pct)
+                st.session_state.alerts_history.append({
+                    "Symbol": sym_short,
+                    "Type": alert_type,
+                    "Score": star_score_plain,
+                    "Time": now_ist.strftime("%H:%M:%S"),
+                    "LTP": ltp,
+                    "Chart": tv_url
+                })
 
             vol_status_label = "🚀 BREAKOUT" if is_vol_break_500k else ("👀 WATCH (100K)" if is_vol_break_100k else "Normal")
 
             results.append({
-                "Symbol": sym_short, 
+                "Symbol": sym_short,
                 "Score": star_score_html,
-                "LTP": ltp, 
-                "Change %": pct, 
-                "Vol Status": vol_status_label, 
-                "Donchian 15m (28,6)": dc_status, 
+                "LTP": ltp,
+                "Change %": pct,
+                "Vol Osc %": vol_osc_pct,
+                "Vol Status": vol_status_label,
+                "Donchian 15m (28,6)": dc_status,
                 "Chart": tv_url
             })
         except Exception:
             continue
 
+    # Execute active exit rules engine during live trading hours
     if market_active:
         process_active_trade_exits(st.session_state.kite, st.session_state.access_token, API_KEY)
 
-    try:
-        df_sheet_log = conn.read(worksheet="Alert_Log")
-        if not df_sheet_log.empty:
-            for col in df_sheet_log.columns:
-                if "%" in str(col) or "CHANGE" in str(col).upper():
-                    df_sheet_log[col] = pd.to_numeric(df_sheet_log[col].astype(str).str.replace('%', ''), errors='coerce')
-                    df_sheet_log[col] = df_sheet_log[col].apply(lambda x: x * 100.0 if abs(x) < 0.20 and x != 0 else x)
-        sheet_log_count = len(df_sheet_log) if not df_sheet_log.empty else 0
-    except Exception:
-        df_sheet_log = pd.DataFrame()
-        sheet_log_count = 0
+# --- 8. DASHBOARD DISPLAY ---
+if results:
+    df_full = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
+    df_display = df_full if show_all_stocks else df_full[df_full['Change %'] >= 1.0]
 
-    # --- 8. DASHBOARD DISPLAY ---
-    if results:
-        df_full = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
-        df_display = df_full if show_all_stocks else df_full[df_full['Change %'] >= 1.0]
-        
-        df_combo = df_display[
-            (df_display['Vol Status'] == "🚀 BREAKOUT") & 
-            (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
-        ]
-        
-        df_early = df_display[
-            (df_display['Vol Status'] == "👀 WATCH (100K)") & 
-            (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
-        ]
+    df_combo = df_display[
+        (df_display['Vol Status'] == "🚀 BREAKOUT") & 
+        (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
+    ]
 
-        combo_count = len(df_combo)
-        early_count = len(df_early)
-        vol_count = len(df_display[df_display['Vol Status'].str.contains("BREAKOUT|WATCH", regex=True, na=False)])
-        dc_count = len(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
-        history_count = len(st.session_state.alerts_history)
+    df_early = df_display[
+        (df_display['Vol Status'] == "👀 WATCH (100K)") & 
+        (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
+    ]
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Sheet Symbols", f"{total_fetched_count}")
-        c2.metric("Active Filtered Stocks", f"{len(df_display)}")
-        c3.metric("GSheets Alert_Log Count", f"{sheet_log_count}")
-        c4.metric("Live PC Alerts Logged", f"{history_count}")
+    combo_count = len(df_combo)
+    early_count = len(df_early)
+    vol_count = len(df_display[df_display['Vol Osc %'] > 0]) if 'Vol Osc %' in df_display.columns else 0
+    dc_count = len(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
+    history_count = len(st.session_state.alerts_history)
 
-        t_combo, t_early, t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
-            f"🎯 Happy Breakout ({combo_count})",
-            f"👀 Early Watch ({early_count})",
-            f"📊 Market ({len(df_display)})", 
-            f"🔥 Volume ({vol_count})", 
-            f"📈 Donchian 15m ({dc_count})",
-            f"📋 GSheet Alert_Log ({sheet_log_count})",
-            f"📝 Live History ({history_count})"
-        ])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Sheet Symbols", f"{total_fetched_count}")
+    c2.metric("Active Filtered Stocks", f"{len(df_display)}")
+    c3.metric("GSheets Alert_Log Count", f"{sheet_log_count}")
+    c4.metric("Live PC Alerts Logged", f"{history_count}")
 
-        col_config = {
-            "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-            "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
-            "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
-        }
+    view_mode = st.radio(
+        "Table View Mode:",
+        ["Rich View (Popups Enabled)", "Sortable Mode (Backtest)"],
+        horizontal=True
+    )
 
-        def render_html_table(df_subset):
-            if df_subset.empty:
-                st.info("No data available.")
-                return
+    t_combo, t_early, t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
+        f"🚀 Happy Breakout ({combo_count})",
+        f"👀 Early Watch ({early_count})",
+        f"📊 Market ({len(df_display)})",
+        f"🔥 Volume ({vol_count})",
+        f"📉 Donchian 15m ({dc_count})",
+        f"📜 GSheet Alert_Log ({sheet_log_count})",
+        f"📜 Live History ({history_count})"
+    ])
+
+    col_config = {
+        "Score": st.column_config.TextColumn("Score"),
+        "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
+        "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
+        "Vol Osc %": st.column_config.NumberColumn("Vol Osc %", format="%.2f%%"),
+        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
+    }
+
+    def render_table(df_subset, tab_key="data"):
+        if df_subset.empty:
+            st.info("No data available.")
+            return
+
+        if view_mode == "Sortable Mode (Backtest)":
+            df_clean = df_subset.copy()
+            if 'Score' in df_clean.columns:
+                df_clean['Score'] = df_clean['Score'].astype(str).str.replace(r'<[^>]*>', '', regex=True)
+            st.dataframe(df_clean, use_container_width=True, hide_index=True, column_config=col_config)
+        else:
             df_render = df_subset.copy()
+
+            df_download = df_render.copy()
+            if 'Score' in df_download.columns:
+                df_download['Score'] = df_download['Score'].astype(str).str.replace(r'<[^>]*>', '', regex=True)
+            csv_data = df_download.to_csv(index=False).encode('utf-8')
+
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv_data,
+                file_name=f"{tab_key}_export.csv",
+                mime="text/csv",
+                key=f"dl_{tab_key}_{len(df_subset)}"
+            )
+
             df_render['Chart'] = df_render['Chart'].apply(lambda x: f'<a href="{x}" target="_blank">Open TV 📈</a>')
             df_render['LTP'] = df_render['LTP'].apply(lambda x: f"{x:.2f}")
             df_render['Change %'] = df_render['Change %'].apply(lambda x: f"{x:.2f}%")
-            
+            if 'Vol Osc %' in df_render.columns:
+                df_render['Vol Osc %'] = df_render['Vol Osc %'].apply(lambda x: f"{x:.2f}%")
+
             html_table = df_render.to_html(escape=False, index=False, classes="custom-table")
             st.markdown(html_table, unsafe_allow_html=True)
 
-        with t_combo:
-            render_html_table(df_combo)
-        with t_early:
-            render_html_table(df_early)
-        with t_main: 
-            render_html_table(df_display)
-        with t_vol: 
-            render_html_table(df_display[df_display['Vol Status'].str.contains("BREAKOUT|WATCH", regex=True, na=False)])
-        with t_dc: 
-            render_html_table(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
-        with t_gsheet_log:
-            if not df_sheet_log.empty:
-                st.dataframe(df_sheet_log, use_container_width=True, hide_index=True)
-            else:
-                st.info("No records in Google Sheet Alert_Log yet.")
-        with t_log: 
-            if st.session_state.alerts_history:
-                st.dataframe(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], use_container_width=True, hide_index=True, column_config=col_config)
+    with t_combo:
+        render_table(df_combo, tab_key="happy_breakout")
+    with t_early:
+        render_table(df_early, tab_key="early_watch")
+    with t_main:
+        render_table(df_display, tab_key="market_all")
+    with t_vol:
+        if 'Vol Osc %' in df_display.columns:
+            render_table(df_display[df_display['Vol Osc %'] > 0].sort_values(by='Vol Osc %', ascending=False), tab_key="volume")
+        else:
+            st.info("No volume oscillator data available.")
+    with t_dc:
+        render_table(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)], tab_key="donchian")
+    with t_gsheet_log:
+        if not df_sheet_log.empty:
+            render_table(df_sheet_log, tab_key="gsheet_log")
+        else:
+            st.info("No records in Google Sheet Alert_Log yet.")
+    with t_log:
+        if st.session_state.alerts_history:
+            render_table(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], tab_key="live_history")
 
-    if market_active:
-        time.sleep(60)
-        st.rerun()
+if market_active:
+    time.sleep(60)
+    st.rerun()
