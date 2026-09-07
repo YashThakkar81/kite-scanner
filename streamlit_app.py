@@ -43,7 +43,7 @@ st.markdown("""
     }
     .score-tooltip .tooltip-text {
         visibility: hidden;
-        width: 220px;
+        width: 250px;
         background-color: #1E1E1E;
         color: #FFFFFF;
         text-align: left;
@@ -53,7 +53,7 @@ st.markdown("""
         z-index: 99999;
         bottom: 125%;
         left: 50%;
-        margin-left: -110px;
+        margin-left: -125px;
         box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.5);
         font-size: 12px;
         line-height: 1.5;
@@ -160,21 +160,20 @@ def fetch_pivot_s1(kite_inst, instrument_token):
 def calculate_volume_oscillator(df, short_len=1, long_len=20):
     if df is None or len(df) < long_len:
         return 0.0
-    
+
     vol_series = df['volume'].astype(float)
     short_ema = vol_series.ewm(span=short_len, adjust=False).mean()
     long_ema = vol_series.ewm(span=long_len, adjust=False).mean()
-    
+
     last_short = short_ema.iloc[-1]
     last_long = long_ema.iloc[-1]
-    
+
     if last_long == 0:
         return 0.0
-        
+
     vo = ((last_short - last_long) / last_long) * 100.0
     return round(float(vo), 2)
 
-# --- FAST MULTI-TIMEFRAME CANDLE FETCHING WITH THREADING ---
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
     try:
@@ -210,6 +209,7 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
 
 def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     c1, c2, c3, c4, c5 = False, False, False, False, False
+    rsi_15m_val, rsi_1h_val, rsi_day_val, rsi_wk_val = 0.0, 0.0, 0.0, 0.0
 
     # Star 1: 15m RVOL >= 2.5x SMA(20)
     if df_15m is not None and len(df_15m) >= 20:
@@ -220,34 +220,57 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
 
     # Star 2: 15m RSI >= 70 OR RSI > EMA(34)
     if df_15m is not None and len(df_15m) >= 34:
-        rsi_15m, ema_15m = calculate_rsi_and_ema(df_15m['close'])
-        if rsi_15m >= 70 or rsi_15m > ema_15m:
+        rsi_15m_val, ema_15m = calculate_rsi_and_ema(df_15m['close'])
+        if rsi_15m_val >= 70 or rsi_15m_val > ema_15m:
             c2 = True
 
     # Star 3: 1h RSI >= 70 OR RSI > EMA(34)
     if df_1h is not None and len(df_1h) >= 34:
-        rsi_1h, ema_1h = calculate_rsi_and_ema(df_1h['close'])
-        if rsi_1h >= 70 or rsi_1h > ema_1h:
+        rsi_1h_val, ema_1h = calculate_rsi_and_ema(df_1h['close'])
+        if rsi_1h_val >= 70 or rsi_1h_val > ema_1h:
             c3 = True
 
     # Star 4: Daily RSI >= 50 OR RSI > EMA(34)
     if df_day is not None and len(df_day) >= 34:
-        rsi_day, ema_day = calculate_rsi_and_ema(df_day['close'])
-        if rsi_day >= 50 or rsi_day > ema_day:
+        rsi_day_val, ema_day = calculate_rsi_and_ema(df_day['close'])
+        if rsi_day_val >= 50 or rsi_day_val > ema_day:
             c4 = True
 
     # Star 5: Weekly RSI >= 50 OR RSI > EMA(34)
     if df_week is not None and len(df_week) >= 34:
-        rsi_wk, ema_wk = calculate_rsi_and_ema(df_week['close'])
-        if rsi_wk >= 50 or rsi_wk > ema_wk:
+        rsi_wk_val, ema_wk = calculate_rsi_and_ema(df_week['close'])
+        if rsi_wk_val >= 50 or rsi_wk_val > ema_wk:
             c5 = True
 
     score_num = sum([c1, c2, c3, c4, c5])
     score_plain = f"{score_num}/5"
 
-    vo_str = f"{vol_osc_pct:+.2f}%" if vol_osc_pct is not None and pd.notna(vol_osc_pct) else "N/A"
+    # Volume Oscillator Formatting with Green Dot threshold (>= 150%)
+    if vol_osc_pct is not None and pd.notna(vol_osc_pct):
+        vo_str = f"+{vol_osc_pct:.2f}%" if vol_osc_pct >= 0 else f"{vol_osc_pct:.2f}%"
+        if vol_osc_pct >= 150.0:
+            vo_str += " 🟢"
+    else:
+        vo_str = "N/A"
 
-    html_tooltip = f"""<div class="score-tooltip">{score_num}/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">{"✅" if c1 else "❌"} 15m RVOL &ge; 2.5x<br>{"✅" if c2 else "❌"} 15m RSI Criteria<br>{"✅" if c3 else "❌"} 1h RSI Criteria<br>{"✅" if c4 else "❌"} Daily RSI Criteria<br>{"✅" if c5 else "❌"} Weekly RSI Criteria<br><hr style="margin:4px 0;"><span style="color:#FF9800; font-weight:bold;">Vol Osc: {vo_str}</span></div></div>"""
+    # Pop-up Tooltip HTML with Exact RSI Values Preceding Pass/Fail Icons
+    mark_1 = "✅" if c1 else "❌"
+    mark_2 = f" ({rsi_15m_val:.2f}) ✅" if c2 else f" ({rsi_15m_val:.2f}) ❌"
+    mark_3 = f" ({rsi_1h_val:.2f}) ✅" if c3 else f" ({rsi_1h_val:.2f}) ❌"
+    mark_4 = f" ({rsi_day_val:.2f}) ✅" if c4 else f" ({rsi_day_val:.2f}) ❌"
+    mark_5 = f" ({rsi_wk_val:.2f}) ✅" if c5 else f" ({rsi_wk_val:.2f}) ❌"
+
+    html_tooltip = (
+        f'<div class="score-tooltip">{score_num}/5'
+        f'<span class="tooltip-text"><b>5-Star Checklist Breakdown</b><hr style="margin:4px 0;">'
+        f'Vol Spike (2.5x): {mark_1}<br>'
+        f'RSI 15m: {mark_2}<br>'
+        f'RSI 1h: {mark_3}<br>'
+        f'RSI Daily: {mark_4}<br>'
+        f'RSI Weekly: {mark_5}<br>'
+        f'VO: {vo_str}'
+        f'</span></div>'
+    )
 
     return score_plain, html_tooltip
 
@@ -268,9 +291,15 @@ def send_telegram_raw(message):
         pass
 
 def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url="", vo_val=None):
-    vo_str = f"{vo_val:+.2f}%" if vo_val is not None and pd.notna(vo_val) else "N/A"
+    if vo_val is not None and pd.notna(vo_val):
+        vo_str = f"+{vo_val:.2f}%" if vo_val >= 0 else f"{vo_val:.2f}%"
+        if vo_val >= 150.0:
+            vo_str += " 🟢"
+    else:
+        vo_str = "N/A"
+
     chart_link = f'<a href="{chart_url}">Open TV ↗</a>' if chart_url else ""
-    
+
     if alert_type == "Happy Breakout":
         message = (
             f"<b>HAPPY BREAKOUT: {symbol}</b>\n"
@@ -289,6 +318,7 @@ def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", 
             f"Entry: ₹{ltp}\n"
             f"Chart: {chart_link}"
         )
+
     send_telegram_raw(message)
 
 def send_telegram_exit(symbol, exit_type, ltp, chart_url=""):
@@ -322,7 +352,7 @@ def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_
     """
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol} (Score: {score})", icon="🚀")
-    
+
     send_telegram_alert(symbol, alert_type, ltp, sl1=sl1, sl2=sl2, score=score, chart_url=chart_url, vo_val=vo_val)
 
 # --- 3. SESSION STATE ---
@@ -723,8 +753,8 @@ if results:
         f"👀 Early Watch ({early_count})",
         f"📊 Market ({len(df_display)})",
         f"🔥 Volume ({vol_count})",
-        f"📉 Donchian 15m ({dc_count})",
-        f"📜 GSheet Alert_Log ({sheet_log_count})",
+        f"📈 Donchian 15m ({dc_count})",
+        f"📊 GSheet Alert_Log ({sheet_log_count})",
         f"📜 Live History ({history_count})"
     ])
 
@@ -733,7 +763,7 @@ if results:
         "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
         "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
         "Vol Osc %": st.column_config.NumberColumn("Vol Osc %", format="%.2f%%"),
-        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV 📈")
+        "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV ↗")
     }
 
     def render_table(df_subset, tab_key="data"):
@@ -762,11 +792,27 @@ if results:
                 key=f"dl_{tab_key}_{len(df_subset)}"
             )
 
-            df_render['Chart'] = df_render['Chart'].apply(lambda x: f'<a href="{x}" target="_blank">Open TV 📈</a>')
-            df_render['LTP'] = df_render['LTP'].apply(lambda x: f"{x:.2f}")
-            df_render['Change %'] = df_render['Change %'].apply(lambda x: f"{x:.2f}%")
+            if 'Chart' in df_render.columns:
+                df_render['Chart'] = df_render['Chart'].apply(
+                    lambda x: f'<a href="{x}" target="_blank">Open TV ↗</a>' if pd.notna(x) and str(x).startswith("http") else x
+                )
+
+            if 'LTP' in df_render.columns:
+                df_render['LTP'] = df_render['LTP'].apply(
+                    lambda x: f"{float(x):.2f}" if pd.notna(x) and isinstance(x, (int, float)) else x
+                )
+
+            if 'Change %' in df_render.columns:
+                df_render['Change %'] = df_render['Change %'].apply(
+                    lambda x: f"{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) else x
+                )
+
             if 'Vol Osc %' in df_render.columns:
-                df_render['Vol Osc %'] = df_render['Vol Osc %'].apply(lambda x: f"{x:.2f}%")
+                df_render['Vol Osc %'] = df_render['Vol Osc %'].apply(
+                    lambda x: f"+{float(x):.2f}% 🟢" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 150.0 
+                    else (f"+{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 0 
+                    else (f"{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) else x))
+                )
 
             html_table = df_render.to_html(escape=False, index=False, classes="custom-table")
             st.markdown(html_table, unsafe_allow_html=True)
@@ -792,6 +838,10 @@ if results:
     with t_log:
         if st.session_state.alerts_history:
             render_table(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], tab_key="live_history")
+
+if market_active:
+    time.sleep(60)
+    st.rerun()
 
 if market_active:
     time.sleep(60)
