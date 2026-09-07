@@ -112,20 +112,95 @@ def save_active_trades(trades):
 
 # --- TECHNICAL HELPERS: ATR, PIVOT S1, RSI, EMA & VOLUME OSCILLATOR ---
 def calculate_rsi_and_ema(series, period=14, ema_period=34):
-    if len(series) < period + 1:
-        return 0.0, 0.0
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi_series = 100 - (100 / (1 + rs))
-    rsi_series = rsi_series.fillna(0.0)
+    """
+    TradingView / Wilder RSI calculation.
 
-    if len(rsi_series) < ema_period:
-        return float(rsi_series.iloc[-1]), 0.0
+    Uses Wilder's RMA with SMA initialization.
+    This provides a much closer match to Zerodha Kite /
+    TradingView RSI(14).
+    """
 
-    rsi_ema_series = rsi_series.ewm(span=ema_period, adjust=False).mean()
-    return float(rsi_series.iloc[-1]), float(rsi_ema_series.iloc[-1])
+    if series is None:
+        return 50.0, 50.0
+
+    close = pd.to_numeric(series, errors="coerce").dropna()
+
+    if len(close) < period + 1:
+        return 50.0, 50.0
+
+    delta = close.diff()
+
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+
+    # -----------------------------------------
+    # Wilder's RMA
+    # -----------------------------------------
+    def wilder_rma(values, length):
+        values = pd.Series(values, dtype="float64")
+
+        result = pd.Series(
+            float("nan"),
+            index=values.index,
+            dtype="float64"
+        )
+
+        if len(values) < length + 1:
+            return result
+
+        # Initial Wilder average = SMA
+        result.iloc[length] = values.iloc[1:length + 1].mean()
+
+        alpha = 1.0 / length
+
+        for i in range(length + 1, len(values)):
+            result.iloc[i] = (
+                alpha * values.iloc[i]
+                + (1.0 - alpha) * result.iloc[i - 1]
+            )
+
+        return result
+
+    avg_gain = wilder_rma(gain, period)
+    avg_loss = wilder_rma(loss, period)
+
+    # -----------------------------------------
+    # RSI
+    # -----------------------------------------
+    rs = avg_gain / avg_loss
+
+    rsi_series = 100.0 - (
+        100.0 / (1.0 + rs)
+    )
+
+    # Handle zero-loss / zero-gain cases
+    rsi_series = rsi_series.where(
+        avg_loss != 0,
+        100.0
+    )
+
+    rsi_series = rsi_series.where(
+        ~((avg_gain == 0) & (avg_loss == 0)),
+        50.0
+    )
+
+    rsi_series = rsi_series.dropna()
+
+    if rsi_series.empty:
+        return 50.0, 50.0
+
+    # -----------------------------------------
+    # RSI EMA(34)
+    # -----------------------------------------
+    rsi_ema_series = rsi_series.ewm(
+        span=ema_period,
+        adjust=False
+    ).mean()
+
+    last_rsi = float(rsi_series.iloc[-1])
+    last_rsi_ema = float(rsi_ema_series.iloc[-1])
+
+    return last_rsi, last_rsi_ema
 
 def calculate_atr14(df):
     if df is None or len(df) < 15:
@@ -190,8 +265,8 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
         with ThreadPoolExecutor(max_workers=4) as executor:
             f_15m = executor.submit(fetch_tf, "15minute", 10)
             f_1h = executor.submit(fetch_tf, "60minute", 30)
-            f_day = executor.submit(fetch_tf, "day", 100)
-            f_week = executor.submit(fetch_tf, "week", 365)
+            f_day = executor.submit(fetch_tf, "day", 1000)
+            f_week = executor.submit(fetch_tf, "week", 750)
 
             hist_15m = f_15m.result()
             hist_1h = f_1h.result()
