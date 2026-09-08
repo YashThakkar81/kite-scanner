@@ -711,19 +711,11 @@ if 'access_token' in st.session_state:
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
 
-            # LAZY EVALUATION
-            should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k
-
-            if should_evaluate:
-                df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
-                vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
-                star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
-                dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
-            else:
-                vol_osc_pct = 0.0
-                star_score_plain, star_score_html = "0/5", '<div class="score-tooltip">0/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">Not Evaluated</div></div>'
-                df_15m = None
-                dc_status, is_dc_breakout = "Below", False
+            # Direct evaluation without lazy-blocking
+            df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
+            vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
+            star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
+            dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
@@ -732,15 +724,14 @@ if 'access_token' in st.session_state:
             is_early_alert = is_vol_break_100k and (not is_vol_break_500k) and is_dc_breakout
 
             alert_type = ""
-            if market_active:
-                if notify_combo and is_happy_breakout and f"{sym_short}|Happy Breakout" not in alerted_keys:
-                    alert_type = "Happy Breakout"
-                elif notify_early and is_early_alert and f"{sym_short}|Early Watchlist Alert" not in alerted_keys:
-                    alert_type = "Early Watchlist Alert"
-                elif notify_vol and is_vol_break_500k and f"{sym_short}|Volume Breakout" not in alerted_keys:
-                    alert_type = "Volume Breakout"
-                elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
-                    alert_type = "Donchian Upper 15m"
+            if notify_combo and is_happy_breakout and f"{sym_short}|Happy Breakout" not in alerted_keys:
+                alert_type = "Happy Breakout"
+            elif notify_early and is_early_alert and f"{sym_short}|Early Watchlist Alert" not in alerted_keys:
+                alert_type = "Early Watchlist Alert"
+            elif notify_vol and is_vol_break_500k and f"{sym_short}|Volume Breakout" not in alerted_keys:
+                alert_type = "Volume Breakout"
+            elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
+                alert_type = "Donchian Upper 15m"
 
             if alert_type:
                 sl1_val, sl2_val = 0.0, 0.0
@@ -829,7 +820,7 @@ if results:
         f"📊 Market ({len(df_display)})",
         f"🔥 Volume ({vol_count})",
         f"📈 Donchian 15m ({dc_count})",
-        f"📊 GSheet Alert_Log ({sheet_log_count})",
+        f"📱 GSheet Alert_Log ({sheet_log_count})",
         f"📜 Live History ({history_count})"
     ])
 
@@ -884,8 +875,8 @@ if results:
 
             if 'Vol Osc %' in df_render.columns:
                 df_render['Vol Osc %'] = df_render['Vol Osc %'].apply(
-                    lambda x: f"+{float(x):.2f}% 🟢" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 150.0 
-                    else (f"+{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 0 
+                    lambda x: f"+{float(x):.2f}% 🟢" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 150.0
+                    else (f"+{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 0
                     else (f"{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) else x))
                 )
 
@@ -914,10 +905,5 @@ if results:
         if st.session_state.alerts_history:
             render_table(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], tab_key="live_history")
 
-if market_active:
-    time.sleep(60)
-    st.rerun()
-
-if market_active:
-    time.sleep(60)
-    st.rerun()
+time.sleep(60)
+st.rerun()
