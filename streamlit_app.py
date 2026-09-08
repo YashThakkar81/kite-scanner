@@ -844,7 +844,9 @@ if results:
         if not df_sheet_log.empty:
             render_table(df_sheet_log, tab_key="gsheet_log")
         else:
-            st.info("No records in Google Sheet Alert_Log yet.")
-    with t_log:
-        if st.session_state.alerts_history:
-            render_table(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], tab_key="live_history")
+            st.info("No GSheet alert logs available.")
+
+# --- AUTO-REFRESH ENGINE ---
+if market_active:
+    time.sleep(15)
+    st.rerun()
