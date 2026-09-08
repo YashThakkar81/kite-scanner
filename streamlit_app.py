@@ -10,10 +10,21 @@ import pytz
 import requests
 from datetime import datetime, timedelta, time as dtime
 from concurrent.futures import ThreadPoolExecutor
+from streamlit_autorefresh import st_autorefresh
 
 # --- 1. CONFIGURATION & BLUE TOGGLE + TOOLTIP STYLING ---
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
+
+# --- MARKET HOURS AUTO-REFRESH CONTROL ---
+now_ist = datetime.now(IST)
+current_time = now_ist.time()
+market_start = dtime(9, 7)
+market_end = dtime(15, 30)
+is_weekday = now_ist.weekday() < 5  # Monday to Friday
+
+if is_weekday and (market_start <= current_time <= market_end):
+    st_autorefresh(interval=60000, key="omni_scanner_autorefresh")
 
 st.markdown("""
     <style>
@@ -95,15 +106,19 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 
 # --- PERSISTENT ACTIVE TRADES STORAGE UTILS ---
 def load_active_trades():
-    if os.path.exists(ACTIVE_TRADES_FILE):
-        try:
-            with open(ACTIVE_TRADES_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    if "active_trades" not in st.session_state:
+        if os.path.exists(ACTIVE_TRADES_FILE):
+            try:
+                with open(ACTIVE_TRADES_FILE, "r") as f:
+                    st.session_state["active_trades"] = json.load(f)
+            except Exception:
+                st.session_state["active_trades"] = {}
+        else:
+            st.session_state["active_trades"] = {}
+    return st.session_state["active_trades"]
 
 def save_active_trades(trades):
+    st.session_state["active_trades"] = trades
     try:
         with open(ACTIVE_TRADES_FILE, "w") as f:
             json.dump(trades, f, indent=4)
@@ -112,52 +127,28 @@ def save_active_trades(trades):
 
 # --- TECHNICAL HELPERS: ATR, PIVOT S1, RSI, EMA & VOLUME OSCILLATOR ---
 def calculate_rsi_and_ema(series, period=14, ema_period=34):
-    if series is None:
+    if len(series) < period + 1:
         return 50.0, 50.0
-
-    close = pd.to_numeric(series, errors="coerce").dropna()
-
-    if len(close) < period + 1:
-        return 50.0, 50.0
-
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-
-    def wilder_rma(values, length):
-        values = pd.Series(values, dtype="float64")
-        result = pd.Series(float("nan"), index=values.index, dtype="float64")
-
-        if len(values) < length + 1:
-            return result
-
-        result.iloc[length] = values.iloc[1:length + 1].mean()
-        alpha = 1.0 / length
-
-        for i in range(length + 1, len(values)):
-            result.iloc[i] = (alpha * values.iloc[i] + (1.0 - alpha) * result.iloc[i - 1])
-
-        return result
-
-    avg_gain = wilder_rma(gain, period)
-    avg_loss = wilder_rma(loss, period)
-
-    rs = avg_gain / avg_loss
+    
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    # Wilder's Exponential Smoothing (RMA) - Matches Kite / TradingView exactly
+    alpha = 1.0 / period
+    avg_gain = gain.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, float('nan'))
     rsi_series = 100.0 - (100.0 / (1.0 + rs))
+    rsi_series = rsi_series.fillna(50.0)
 
-    rsi_series = rsi_series.where(avg_loss != 0, 100.0)
-    rsi_series = rsi_series.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)
-    rsi_series = rsi_series.dropna()
-
-    if rsi_series.empty:
-        return 50.0, 50.0
+    if len(rsi_series) < ema_period:
+        last_rsi = float(rsi_series.iloc[-1])
+        return last_rsi, last_rsi
 
     rsi_ema_series = rsi_series.ewm(span=ema_period, adjust=False).mean()
-
-    last_rsi = float(rsi_series.iloc[-1])
-    last_rsi_ema = float(rsi_ema_series.iloc[-1])
-
-    return last_rsi, last_rsi_ema
+    return float(rsi_series.iloc[-1]), float(rsi_ema_series.iloc[-1])
 
 def calculate_atr14(df):
     if df is None or len(df) < 15:
@@ -174,11 +165,12 @@ def calculate_atr14(df):
     atr = df['tr'].rolling(window=14).mean().iloc[-1]
     return float(atr) if pd.notna(atr) else 0.0
 
-def fetch_pivot_s1(kite_inst, instrument_token):
+@st.cache_data(ttl=3600)
+def fetch_pivot_s1(_kite_inst, instrument_token):
     try:
         now = datetime.now(IST)
         from_date = now - timedelta(days=5)
-        hist = kite_inst.historical_data(instrument_token, from_date, now.date() - timedelta(days=1), "day")
+        hist = _kite_inst.historical_data(instrument_token, from_date, now.date() - timedelta(days=1), "day")
         if not hist or len(hist) < 1:
             return 0.0
         prev_day = hist[-1]
@@ -188,6 +180,7 @@ def fetch_pivot_s1(kite_inst, instrument_token):
     except Exception:
         return 0.0
 
+# --- TRADINGVIEW VOLUME OSCILLATOR (Shortlen = 1, Longlen = 20) ---
 def calculate_volume_oscillator(df, short_len=1, long_len=20):
     if df is None or len(df) < long_len:
         return 0.0
@@ -219,8 +212,8 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
                 return []
 
         with ThreadPoolExecutor(max_workers=4) as executor:
-            f_15m = executor.submit(fetch_tf, "15minute", 10)
-            f_1h = executor.submit(fetch_tf, "60minute", 30)
+            f_15m = executor.submit(fetch_tf, "15minute", 30)
+            f_1h = executor.submit(fetch_tf, "60minute", 90)
             f_day = executor.submit(fetch_tf, "day", 1000)
             f_week = executor.submit(fetch_tf, "week", 750)
 
@@ -242,27 +235,32 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     c1, c2, c3, c4, c5 = False, False, False, False, False
     rsi_15m_val, rsi_1h_val, rsi_day_val, rsi_wk_val = 0.0, 0.0, 0.0, 0.0
 
+    # Star 1: 15m RVOL >= 2.5x SMA(20)
     if df_15m is not None and len(df_15m) >= 20:
         curr_vol = df_15m['volume'].iloc[-1]
         vol_sma20 = df_15m['volume'].rolling(window=20).mean().iloc[-1]
         if vol_sma20 > 0 and (curr_vol >= 2.5 * vol_sma20):
             c1 = True
 
+    # Star 2: 15m RSI >= 70 OR RSI > EMA(34)
     if df_15m is not None and len(df_15m) >= 34:
         rsi_15m_val, ema_15m = calculate_rsi_and_ema(df_15m['close'])
         if rsi_15m_val >= 70 or rsi_15m_val > ema_15m:
             c2 = True
 
+    # Star 3: 1h RSI >= 70 OR RSI > EMA(34)
     if df_1h is not None and len(df_1h) >= 34:
         rsi_1h_val, ema_1h = calculate_rsi_and_ema(df_1h['close'])
         if rsi_1h_val >= 70 or rsi_1h_val > ema_1h:
             c3 = True
 
+    # Star 4: Daily RSI >= 50 OR RSI > EMA(34)
     if df_day is not None and len(df_day) >= 34:
         rsi_day_val, ema_day = calculate_rsi_and_ema(df_day['close'])
         if rsi_day_val >= 50 or rsi_day_val > ema_day:
             c4 = True
 
+    # Star 5: Weekly RSI >= 50 OR RSI > EMA(34)
     if df_week is not None and len(df_week) >= 34:
         rsi_wk_val, ema_wk = calculate_rsi_and_ema(df_week['close'])
         if rsi_wk_val >= 50 or rsi_wk_val > ema_wk:
@@ -271,6 +269,7 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     score_num = sum([c1, c2, c3, c4, c5])
     score_plain = f"{score_num}/5"
 
+    # Volume Oscillator Formatting with Green Dot threshold (>= 150%)
     if vol_osc_pct is not None and pd.notna(vol_osc_pct):
         vo_str = f"+{vol_osc_pct:.2f}%" if vol_osc_pct >= 0 else f"{vol_osc_pct:.2f}%"
         if vol_osc_pct >= 150.0:
@@ -278,6 +277,7 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     else:
         vo_str = "N/A"
 
+    # Pop-up Tooltip HTML with Exact RSI Values Preceding Pass/Fail Icons
     mark_1 = "✅" if c1 else "❌"
     mark_2 = f" ({rsi_15m_val:.2f}) ✅" if c2 else f" ({rsi_15m_val:.2f}) ❌"
     mark_3 = f" ({rsi_1h_val:.2f}) ✅" if c3 else f" ({rsi_1h_val:.2f}) ❌"
@@ -376,6 +376,7 @@ def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_
     """
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol} (Score: {score})", icon="🚀")
+
     send_telegram_alert(symbol, alert_type, ltp, sl1=sl1, sl2=sl2, score=score, chart_url=chart_url, vo_val=vo_val)
 
 # --- 3. SESSION STATE ---
@@ -460,6 +461,7 @@ def is_market_open():
     market_end = dtime(15, 30)
     return market_start <= now.time() <= market_end
 
+# --- Dynamic EMA Exit Monitor Engine ---
 def process_active_trade_exits(kite_inst, access_token, api_key):
     now_time = datetime.now(IST).time()
     active_trades = load_active_trades()
@@ -600,6 +602,7 @@ if 'access_token' in st.session_state:
         except Exception:
             continue
 
+    # READ GSHEET ALERT_LOG
     try:
         df_sheet_log = conn.read(worksheet="Alert_Log")
         if not df_sheet_log.empty:
@@ -657,10 +660,19 @@ if 'access_token' in st.session_state:
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
 
-            df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
-            vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
-            star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
-            dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
+            # LAZY EVALUATION
+            should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k
+
+            if should_evaluate:
+                df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
+                vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
+                star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
+                dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
+            else:
+                vol_osc_pct = 0.0
+                star_score_plain, star_score_html = "0/5", '<div class="score-tooltip">0/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">Not Evaluated</div></div>'
+                df_15m = None
+                dc_status, is_dc_breakout = "Below", False
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
@@ -669,14 +681,15 @@ if 'access_token' in st.session_state:
             is_early_alert = is_vol_break_100k and (not is_vol_break_500k) and is_dc_breakout
 
             alert_type = ""
-            if notify_combo and is_happy_breakout and f"{sym_short}|Happy Breakout" not in alerted_keys:
-                alert_type = "Happy Breakout"
-            elif notify_early and is_early_alert and f"{sym_short}|Early Watchlist Alert" not in alerted_keys:
-                alert_type = "Early Watchlist Alert"
-            elif notify_vol and is_vol_break_500k and f"{sym_short}|Volume Breakout" not in alerted_keys:
-                alert_type = "Volume Breakout"
-            elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
-                alert_type = "Donchian Upper 15m"
+            if market_active:
+                if notify_combo and is_happy_breakout and f"{sym_short}|Happy Breakout" not in alerted_keys:
+                    alert_type = "Happy Breakout"
+                elif notify_early and is_early_alert and f"{sym_short}|Early Watchlist Alert" not in alerted_keys:
+                    alert_type = "Early Watchlist Alert"
+                elif notify_vol and is_vol_break_500k and f"{sym_short}|Volume Breakout" not in alerted_keys:
+                    alert_type = "Volume Breakout"
+                elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
+                    alert_type = "Donchian Upper 15m"
 
             if alert_type:
                 sl1_val, sl2_val = 0.0, 0.0
@@ -722,6 +735,7 @@ if 'access_token' in st.session_state:
         except Exception:
             continue
 
+    # Execute active exit rules engine during live trading hours
     if market_active:
         process_active_trade_exits(st.session_state.kite, st.session_state.access_token, API_KEY)
 
@@ -764,7 +778,7 @@ if results:
         f"📊 Market ({len(df_display)})",
         f"🔥 Volume ({vol_count})",
         f"📈 Donchian 15m ({dc_count})",
-        f"📱 GSheet Alert_Log ({sheet_log_count})",
+        f"📊 GSheet Alert_Log ({sheet_log_count})",
         f"📜 Live History ({history_count})"
     ])
 
@@ -819,8 +833,8 @@ if results:
 
             if 'Vol Osc %' in df_render.columns:
                 df_render['Vol Osc %'] = df_render['Vol Osc %'].apply(
-                    lambda x: f"+{float(x):.2f}% 🟢" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 150.0
-                    else (f"+{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 0
+                    lambda x: f"+{float(x):.2f}% 🟢" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 150.0 
+                    else (f"+{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 0 
                     else (f"{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) else x))
                 )
 
@@ -844,9 +858,17 @@ if results:
         if not df_sheet_log.empty:
             render_table(df_sheet_log, tab_key="gsheet_log")
         else:
-            st.info("No GSheet alert logs available.")
+            st.info("No records in Google Sheet Alert_Log yet.")
+    with t_log:
+        if st.session_state.alerts_history:
+            render_table(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], tab_key="live_history")
 
-# --- AUTO-REFRESH ENGINE ---
 if market_active:
-    time.sleep(15)
+    time.sleep(60)
     st.rerun()
+
+if market_active:
+    time.sleep(60)
+    st.rerun()
+
+
