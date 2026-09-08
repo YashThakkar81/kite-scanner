@@ -728,19 +728,17 @@ if 'access_token' in st.session_state:
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
                 dc_short_status = dc_status.replace("🚀 UPPER BREAKOUT", "🚀 UB")
 
-                # BB Medians Numerical Values
-                bb_med_15m = calculate_bb_median(df_15m, length=20, offset=6)
-                bb_med_1h   = calculate_bb_median(df_1h, length=20, offset=6)
-                
-                # BB Median Status (Daily & Weekly)
-                bb_day_status, bb_day_cross, bb_day_supp = get_bb_status(df_day, ltp)
-                bb_wk_status,  bb_wk_cross,  bb_wk_supp  = get_bb_status(df_week, ltp)
+                # BB Median Status across all timeframes
+                bb_15m_status, _, _ = get_bb_status(df_15m, ltp)
+                bb_1h_status,  _, _ = get_bb_status(df_1h, ltp)
+                bb_day_status, _, _ = get_bb_status(df_day, ltp)
+                bb_wk_status,  _, _ = get_bb_status(df_week, ltp)
             else:
                 vol_osc_pct = 0.0
                 star_score_plain, star_score_html = "0/5", '<div class="score-tooltip">0/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">Not Evaluated</div></div>'
                 df_15m = None
                 dc_short_status, is_dc_breakout = "Below", False
-                bb_med_15m, bb_med_1h = 0.0, 0.0
+                bb_15m_status, bb_1h_status = "Below 🔴", "Below 🔴"
                 bb_day_status, bb_wk_status = "Below 🔴", "Below 🔴"
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
@@ -796,8 +794,8 @@ if 'access_token' in st.session_state:
                 "Score": star_score_html,
                 "LTP": ltp,
                 "Change %": pct,
-                "BB Med 15m": bb_med_15m,
-                "BB Med 1H": bb_med_1h,
+                "BB Med 15m": bb_15m_status,
+                "BB Med 1H": bb_1h_status,
                 "BB Med Day": bb_day_status,
                 "BB Med Wk": bb_wk_status,
                 "Vol Osc %": vol_osc_pct,
