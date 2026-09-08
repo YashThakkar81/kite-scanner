@@ -125,6 +125,24 @@ def save_active_trades(trades):
     except Exception:
         pass
 
+# --- TECHNICAL HELPERS: BB MEDIAN WITH OFFSET ---
+def calculate_bb_median(df, length=20, offset=6):
+    """
+    Calculates 20 SMA shifted forward by 6 bars.
+    Works universally across 15m, 1h, Daily, and Weekly DataFrames.
+    """
+    if df is None or len(df) < (length + offset):
+        return 0.0
+    
+    # 20 SMA of Close Price
+    sma_20 = df['close'].rolling(window=length).mean()
+    
+    # Shift forward by offset (6 bars)
+    bb_median_shifted = sma_20.shift(offset)
+    
+    latest_val = bb_median_shifted.iloc[-1]
+    return round(float(latest_val), 2) if pd.notna(latest_val) else 0.0
+
 # --- TECHNICAL HELPERS: ATR, PIVOT S1, RSI, EMA & VOLUME OSCILLATOR ---
 def calculate_rsi_and_ema(series, period=14, ema_period=34):
     if len(series) < period + 1:
@@ -395,7 +413,7 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
     except Exception:
         pass
 
-# --- 4. DONCHIAN CHANNEL & CACHED HISTORICAL DATA ---
+# --- 4. DONCHIAN CHANNEL, BB MEDIAN STATUS & CACHED HISTORICAL DATA ---
 def get_donchian_status(df, length=28, offset=6):
     if df is None or len(df) < (length + offset):
         return "N/A", False
@@ -410,6 +428,44 @@ def get_donchian_status(df, length=28, offset=6):
     is_breakout = curr_close >= curr_upper
     status_str = "🚀 UPPER BREAKOUT" if is_breakout else "Below"
     return status_str, is_breakout
+
+def get_bb_status(df, ltp, length=20, offset=6):
+    """
+    Calculates BB Median status:
+    - 'Cross Above 🚀' : Recently crossed above BB Median
+    - 'Support 🛡️'    : LTP within 0.5% of BB Median while above it
+    - 'Above 🟢'       : LTP > BB Median
+    - 'Below 🔴'       : LTP < BB Median
+    """
+    if df is None or df.empty or len(df) < (length + offset):
+        return "Below 🔴", False, False
+
+    df_calc = df.iloc[-(length + offset):].copy()
+    sma20 = df_calc['close'].rolling(window=length).mean()
+    
+    current_bb_med = sma20.iloc[-1]
+    prev_bb_med = sma20.iloc[-2] if len(sma20) >= 2 else current_bb_med
+    prev_close = df_calc['close'].iloc[-2] if len(df_calc) >= 2 else ltp
+    
+    if pd.isna(current_bb_med) or current_bb_med == 0:
+        return "Below 🔴", False, False
+
+    is_above = ltp > current_bb_med
+    is_cross_above = (prev_close <= prev_bb_med) and (ltp > current_bb_med)
+    
+    dist_pct = ((ltp - current_bb_med) / current_bb_med) * 100.0
+    is_support = (0.0 <= dist_pct <= 0.5)
+
+    if is_cross_above:
+        status_str = "Cross Above 🚀"
+    elif is_support:
+        status_str = "Support 🛡️"
+    elif is_above:
+        status_str = "Above 🟢"
+    else:
+        status_str = "Below 🔴"
+
+    return status_str, is_cross_above, is_support
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_15m_candles(access_token, api_key, instrument_token):
@@ -667,12 +723,25 @@ if 'access_token' in st.session_state:
                 df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
                 vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
                 star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
+                
+                # Donchian 15m Status
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
+                dc_short_status = dc_status.replace("🚀 UPPER BREAKOUT", "🚀 UB")
+
+                # BB Medians Numerical Values
+                bb_med_15m = calculate_bb_median(df_15m, length=20, offset=6)
+                bb_med_1h   = calculate_bb_median(df_1h, length=20, offset=6)
+                
+                # BB Median Status (Daily & Weekly)
+                bb_day_status, bb_day_cross, bb_day_supp = get_bb_status(df_day, ltp)
+                bb_wk_status,  bb_wk_cross,  bb_wk_supp  = get_bb_status(df_week, ltp)
             else:
                 vol_osc_pct = 0.0
                 star_score_plain, star_score_html = "0/5", '<div class="score-tooltip">0/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">Not Evaluated</div></div>'
                 df_15m = None
-                dc_status, is_dc_breakout = "Below", False
+                dc_short_status, is_dc_breakout = "Below", False
+                bb_med_15m, bb_med_1h = 0.0, 0.0
+                bb_day_status, bb_wk_status = "Below 🔴", "Below 🔴"
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
@@ -727,10 +796,15 @@ if 'access_token' in st.session_state:
                 "Score": star_score_html,
                 "LTP": ltp,
                 "Change %": pct,
+                "BB Med 15m": bb_med_15m,
+                "BB Med 1H": bb_med_1h,
+                "BB Med Day": bb_day_status,
+                "BB Med Wk": bb_wk_status,
                 "Vol Osc %": vol_osc_pct,
                 "Vol Status": vol_status_label,
-                "Donchian 15m (28,6)": dc_status,
-                "Chart": tv_url
+                "DC 15m": dc_short_status,
+                "Chart": tv_url,
+                "Volume": vol
             })
         except Exception:
             continue
@@ -744,20 +818,45 @@ if results:
     df_full = pd.DataFrame(results).sort_values(by="Change %", ascending=False)
     df_display = df_full if show_all_stocks else df_full[df_full['Change %'] >= 1.0]
 
-    df_combo = df_display[
-        (df_display['Vol Status'] == "🚀 BREAKOUT") & 
-        (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
-    ]
+    def get_numeric_vol(val):
+        try:
+            if isinstance(val, (int, float)):
+                return float(val)
+            val_str = str(val).replace(',', '').strip().upper()
+            if 'K' in val_str:
+                return float(val_str.replace('K', '')) * 1_000
+            elif 'M' in val_str:
+                return float(val_str.replace('M', '')) * 1_000_000
+            elif 'L' in val_str:
+                return float(val_str.replace('L', '')) * 100_000
+            elif 'CR' in val_str:
+                return float(val_str.replace('CR', '')) * 10_000_000
+            return float(val_str)
+        except:
+            return 0.0
 
-    df_early = df_display[
-        (df_display['Vol Status'] == "👀 WATCH (100K)") & 
-        (df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False))
-    ]
+    if 'Volume' in df_display.columns:
+        df_display['vol_numeric'] = df_display['Volume'].apply(get_numeric_vol)
+    elif 'Vol' in df_display.columns:
+        df_display['vol_numeric'] = df_display['Vol'].apply(get_numeric_vol)
+    else:
+        df_display['vol_numeric'] = 0.0
+
+    dc_condition = df_display['DC 15m'].astype(str).str.contains("🚀|True|UB", case=False, na=False) if 'DC 15m' in df_display.columns else False
+
+    # Filter Breakout subsets
+    df_combo = df_display[dc_condition & (df_display['vol_numeric'] >= 500000)].copy()
+    df_early = df_display[dc_condition & (df_display['vol_numeric'] >= 100000) & (df_display['vol_numeric'] < 500000)].copy()
+
+    # Clean temporary numeric column
+    for df_item in [df_display, df_combo, df_early]:
+        if 'vol_numeric' in df_item.columns:
+            df_item.drop(columns=['vol_numeric'], inplace=True, errors='ignore')
 
     combo_count = len(df_combo)
     early_count = len(df_early)
     vol_count = len(df_display[df_display['Vol Osc %'] > 0]) if 'Vol Osc %' in df_display.columns else 0
-    dc_count = len(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)])
+    dc_count = len(df_display[df_display['DC 15m'].astype(str).str.contains("🚀", na=False)]) if 'DC 15m' in df_display.columns else 0
     history_count = len(st.session_state.alerts_history)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -778,97 +877,147 @@ if results:
         f"📊 Market ({len(df_display)})",
         f"🔥 Volume ({vol_count})",
         f"📈 Donchian 15m ({dc_count})",
-        f"📊 GSheet Alert_Log ({sheet_log_count})",
+        f"📋 GSheet Alert_Log ({sheet_log_count})",
         f"📜 Live History ({history_count})"
     ])
 
     col_config = {
         "Score": st.column_config.TextColumn("Score"),
-        "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
+        "LTP": st.column_config.NumberColumn("LTP", format="₹%.2f"),
         "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
+        "BB Med 15m": st.column_config.NumberColumn("BB Med 15m", format="₹%.2f"),
+        "BB Med 1H": st.column_config.NumberColumn("BB Med 1H", format="₹%.2f"),
+        "BB Med Day": st.column_config.TextColumn("BB Med Day"),
+        "BB Med Wk": st.column_config.TextColumn("BB Med Wk"),
         "Vol Osc %": st.column_config.NumberColumn("Vol Osc %", format="%.2f%%"),
         "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV ↗")
     }
 
-    def render_table(df_subset, tab_key="data"):
-        if df_subset.empty:
-            st.info("No data available.")
+    def render_custom_table(df_to_render):
+        """Renders HTML table supporting hover tooltips and styled UI elements."""
+        if df_to_render.empty:
+            st.info("No stocks match the current criteria.")
             return
 
-        if view_mode == "Sortable Mode (Backtest)":
-            df_clean = df_subset.copy()
-            if 'Score' in df_clean.columns:
-                df_clean['Score'] = df_clean['Score'].astype(str).str.replace(r'<[^>]*>', '', regex=True)
-            st.dataframe(df_clean, use_container_width=True, hide_index=True, column_config=col_config)
-        else:
-            df_render = df_subset.copy()
-
-            df_download = df_render.copy()
-            if 'Score' in df_download.columns:
-                df_download['Score'] = df_download['Score'].astype(str).str.replace(r'<[^>]*>', '', regex=True)
-            csv_data = df_download.to_csv(index=False).encode('utf-8')
-
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv_data,
-                file_name=f"{tab_key}_export.csv",
-                mime="text/csv",
-                key=f"dl_{tab_key}_{len(df_subset)}"
+        df_calc = df_to_render.copy()
+        if 'Chart' in df_calc.columns:
+            df_calc['Chart'] = df_calc['Chart'].apply(lambda x: f'<a href="{x}" target="_blank">Open TV ↗</a>')
+        
+        if 'Vol Osc %' in df_calc.columns:
+            df_calc['Vol Osc %'] = df_calc['Vol Osc %'].apply(
+                lambda x: f"+{x:.2f}% 🟢" if isinstance(x, (int, float)) and x >= 150.0 else (f"{x:.2f}%" if isinstance(x, (int, float)) else str(x))
             )
 
-            if 'Chart' in df_render.columns:
-                df_render['Chart'] = df_render['Chart'].apply(
-                    lambda x: f'<a href="{x}" target="_blank">Open TV ↗</a>' if pd.notna(x) and str(x).startswith("http") else x
-                )
+        html_code = df_calc.to_html(escape=False, index=False, classes="custom-table")
+        st.markdown(html_code, unsafe_allow_html=True)
 
-            if 'LTP' in df_render.columns:
-                df_render['LTP'] = df_render['LTP'].apply(
-                    lambda x: f"{float(x):.2f}" if pd.notna(x) and isinstance(x, (int, float)) else x
-                )
+    def render_dataframe_mode(df_to_render):
+        """Renders native Streamlit dataframe using defined col_config."""
+        if df_to_render.empty:
+            st.info("No stocks match the current criteria.")
+            return
 
-            if 'Change %' in df_render.columns:
-                df_render['Change %'] = df_render['Change %'].apply(
-                    lambda x: f"{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) else x
-                )
+        df_calc = df_to_render.copy()
+        if 'Score' in df_calc.columns:
+            df_calc['Score'] = df_calc['Score'].apply(lambda x: str(x).rsplit('>', 1)[-1] if '>' in str(x) else str(x))
+        
+        st.dataframe(
+            df_calc,
+            column_config=col_config,
+            hide_index=True,
+            use_container_width=True
+        )
 
-            if 'Vol Osc %' in df_render.columns:
-                df_render['Vol Osc %'] = df_render['Vol Osc %'].apply(
-                    lambda x: f"+{float(x):.2f}% 🟢" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 150.0 
-                    else (f"+{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) and float(x) >= 0 
-                    else (f"{float(x):.2f}%" if pd.notna(x) and isinstance(x, (int, float)) else x))
-                )
+    def display_data(df_data):
+        if view_mode == "Rich View (Popups Enabled)":
+            render_custom_table(df_data)
+        else:
+            render_dataframe_mode(df_data)
 
-            html_table = df_render.to_html(escape=False, index=False, classes="custom-table")
-            st.markdown(html_table, unsafe_allow_html=True)
-
+    # --- TAB CONTENT RENDERING ---
     with t_combo:
-        render_table(df_combo, tab_key="happy_breakout")
+        st.subheader("🚀 Happy Breakout Candidates")
+        display_data(df_combo)
+
     with t_early:
-        render_table(df_early, tab_key="early_watch")
+        st.subheader("👀 Early Watchlist Candidates")
+        display_data(df_early)
+
     with t_main:
-        render_table(df_display, tab_key="market_all")
+        st.subheader("📊 Full Market Overview")
+        display_data(df_display)
+
     with t_vol:
-        if 'Vol Osc %' in df_display.columns:
-            render_table(df_display[df_display['Vol Osc %'] > 0].sort_values(by='Vol Osc %', ascending=False), tab_key="volume")
-        else:
-            st.info("No volume oscillator data available.")
+        st.subheader("🔥 High Volume Oscillator Filter")
+        df_vol_filtered = df_display[df_display['Vol Osc %'] > 0] if 'Vol Osc %' in df_display.columns else pd.DataFrame()
+        display_data(df_vol_filtered)
+
     with t_dc:
-        render_table(df_display[df_display['Donchian 15m (28,6)'].str.contains("🚀", na=False)], tab_key="donchian")
+        st.subheader("📈 Donchian 15m Upper Breakouts")
+        df_dc_filtered = df_display[df_display['DC 15m'].astype(str).str.contains("🚀", na=False)] if 'DC 15m' in df_display.columns else pd.DataFrame()
+        display_data(df_dc_filtered)
+
     with t_gsheet_log:
+        st.subheader("📋 Historical Google Sheets Alert Log")
         if not df_sheet_log.empty:
-            render_table(df_sheet_log, tab_key="gsheet_log")
+            st.dataframe(df_sheet_log, use_container_width=True, hide_index=True)
         else:
-            st.info("No records in Google Sheet Alert_Log yet.")
+            st.info("No historical alerts found in GSheets.")
+
     with t_log:
+        st.subheader("📜 Live PC Session Triggered Alerts Log")
         if st.session_state.alerts_history:
-            render_table(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], tab_key="live_history")
+            df_hist = pd.DataFrame(st.session_state.alerts_history)
+            st.dataframe(
+                df_hist,
+                column_config=col_config,
+                use_container_width=True,
+                hide_index=True
+            )
+            if st.button("Clear Live History", type="secondary"):
+                st.session_state.alerts_history = []
+                st.rerun()
+        else:
+            st.info("No live alerts triggered in this session yet.")
 
-if market_active:
-    time.sleep(60)
-    st.rerun()
+    # --- ACTIVE TRADES MONITORING SECTION ---
+    st.divider()
+    st.header("🎯 Active Managed Trades (Dynamic EMA Exit Monitor)")
+    active_trades = load_active_trades()
 
-if market_active:
-    time.sleep(60)
-    st.rerun()
+    if active_trades:
+        active_rows = []
+        for sym, tdata in active_trades.items():
+            active_rows.append({
+                "Symbol": sym,
+                "Entry Price": tdata.get("entry_price", 0.0),
+                "SL 1 (1.5 ATR)": tdata.get("sl1", 0.0),
+                "SL 2 (Pivot S1)": tdata.get("sl2", 0.0),
+                "Trigger Time": tdata.get("trigger_time", "").replace("T", " ")[:19],
+                "Exit 1 (Close < EMA5)": "⚠️ Triggered" if tdata.get("exit1_triggered") else "Active 🟢",
+                "Final Exit (Close < EMA9)": "❌ Closed" if tdata.get("final_exit_triggered") else "Holding 🟢",
+                "Chart": f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
+            })
+        
+        df_active = pd.DataFrame(active_rows)
+        st.dataframe(
+            df_active,
+            column_config={
+                "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV ↗"),
+                "Entry Price": st.column_config.NumberColumn("Entry Price", format="₹%.2f"),
+                "SL 1 (1.5 ATR)": st.column_config.NumberColumn("SL 1", format="₹%.2f"),
+                "SL 2 (Pivot S1)": st.column_config.NumberColumn("SL 2", format="₹%.2f")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        if st.button("Reset Active Trades Log", type="secondary"):
+            save_active_trades({})
+            st.success("Active trades cleared successfully.")
+            st.rerun()
+    else:
+        st.info("No active managed trades currently tracked.")
 
-
+else:
+    st.info("Click 'Activate Session' or adjust sidebar filters to display market data.")
