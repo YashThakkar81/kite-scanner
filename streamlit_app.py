@@ -112,14 +112,6 @@ def save_active_trades(trades):
 
 # --- TECHNICAL HELPERS: ATR, PIVOT S1, RSI, EMA & VOLUME OSCILLATOR ---
 def calculate_rsi_and_ema(series, period=14, ema_period=34):
-    """
-    TradingView / Wilder RSI calculation.
-
-    Uses Wilder's RMA with SMA initialization.
-    This provides a much closer match to Zerodha Kite /
-    TradingView RSI(14).
-    """
-
     if series is None:
         return 50.0, 50.0
 
@@ -129,73 +121,38 @@ def calculate_rsi_and_ema(series, period=14, ema_period=34):
         return 50.0, 50.0
 
     delta = close.diff()
-
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
 
-    # -----------------------------------------
-    # Wilder's RMA
-    # -----------------------------------------
     def wilder_rma(values, length):
         values = pd.Series(values, dtype="float64")
-
-        result = pd.Series(
-            float("nan"),
-            index=values.index,
-            dtype="float64"
-        )
+        result = pd.Series(float("nan"), index=values.index, dtype="float64")
 
         if len(values) < length + 1:
             return result
 
-        # Initial Wilder average = SMA
         result.iloc[length] = values.iloc[1:length + 1].mean()
-
         alpha = 1.0 / length
 
         for i in range(length + 1, len(values)):
-            result.iloc[i] = (
-                alpha * values.iloc[i]
-                + (1.0 - alpha) * result.iloc[i - 1]
-            )
+            result.iloc[i] = (alpha * values.iloc[i] + (1.0 - alpha) * result.iloc[i - 1])
 
         return result
 
     avg_gain = wilder_rma(gain, period)
     avg_loss = wilder_rma(loss, period)
 
-    # -----------------------------------------
-    # RSI
-    # -----------------------------------------
     rs = avg_gain / avg_loss
+    rsi_series = 100.0 - (100.0 / (1.0 + rs))
 
-    rsi_series = 100.0 - (
-        100.0 / (1.0 + rs)
-    )
-
-    # Handle zero-loss / zero-gain cases
-    rsi_series = rsi_series.where(
-        avg_loss != 0,
-        100.0
-    )
-
-    rsi_series = rsi_series.where(
-        ~((avg_gain == 0) & (avg_loss == 0)),
-        50.0
-    )
-
+    rsi_series = rsi_series.where(avg_loss != 0, 100.0)
+    rsi_series = rsi_series.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)
     rsi_series = rsi_series.dropna()
 
     if rsi_series.empty:
         return 50.0, 50.0
 
-    # -----------------------------------------
-    # RSI EMA(34)
-    # -----------------------------------------
-    rsi_ema_series = rsi_series.ewm(
-        span=ema_period,
-        adjust=False
-    ).mean()
+    rsi_ema_series = rsi_series.ewm(span=ema_period, adjust=False).mean()
 
     last_rsi = float(rsi_series.iloc[-1])
     last_rsi_ema = float(rsi_ema_series.iloc[-1])
@@ -231,7 +188,6 @@ def fetch_pivot_s1(kite_inst, instrument_token):
     except Exception:
         return 0.0
 
-# --- TRADINGVIEW VOLUME OSCILLATOR (Shortlen = 1, Longlen = 20) ---
 def calculate_volume_oscillator(df, short_len=1, long_len=20):
     if df is None or len(df) < long_len:
         return 0.0
@@ -286,32 +242,27 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     c1, c2, c3, c4, c5 = False, False, False, False, False
     rsi_15m_val, rsi_1h_val, rsi_day_val, rsi_wk_val = 0.0, 0.0, 0.0, 0.0
 
-    # Star 1: 15m RVOL >= 2.5x SMA(20)
     if df_15m is not None and len(df_15m) >= 20:
         curr_vol = df_15m['volume'].iloc[-1]
         vol_sma20 = df_15m['volume'].rolling(window=20).mean().iloc[-1]
         if vol_sma20 > 0 and (curr_vol >= 2.5 * vol_sma20):
             c1 = True
 
-    # Star 2: 15m RSI >= 70 OR RSI > EMA(34)
     if df_15m is not None and len(df_15m) >= 34:
         rsi_15m_val, ema_15m = calculate_rsi_and_ema(df_15m['close'])
         if rsi_15m_val >= 70 or rsi_15m_val > ema_15m:
             c2 = True
 
-    # Star 3: 1h RSI >= 70 OR RSI > EMA(34)
     if df_1h is not None and len(df_1h) >= 34:
         rsi_1h_val, ema_1h = calculate_rsi_and_ema(df_1h['close'])
         if rsi_1h_val >= 70 or rsi_1h_val > ema_1h:
             c3 = True
 
-    # Star 4: Daily RSI >= 50 OR RSI > EMA(34)
     if df_day is not None and len(df_day) >= 34:
         rsi_day_val, ema_day = calculate_rsi_and_ema(df_day['close'])
         if rsi_day_val >= 50 or rsi_day_val > ema_day:
             c4 = True
 
-    # Star 5: Weekly RSI >= 50 OR RSI > EMA(34)
     if df_week is not None and len(df_week) >= 34:
         rsi_wk_val, ema_wk = calculate_rsi_and_ema(df_week['close'])
         if rsi_wk_val >= 50 or rsi_wk_val > ema_wk:
@@ -320,7 +271,6 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     score_num = sum([c1, c2, c3, c4, c5])
     score_plain = f"{score_num}/5"
 
-    # Volume Oscillator Formatting with Green Dot threshold (>= 150%)
     if vol_osc_pct is not None and pd.notna(vol_osc_pct):
         vo_str = f"+{vol_osc_pct:.2f}%" if vol_osc_pct >= 0 else f"{vol_osc_pct:.2f}%"
         if vol_osc_pct >= 150.0:
@@ -328,7 +278,6 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     else:
         vo_str = "N/A"
 
-    # Pop-up Tooltip HTML with Exact RSI Values Preceding Pass/Fail Icons
     mark_1 = "✅" if c1 else "❌"
     mark_2 = f" ({rsi_15m_val:.2f}) ✅" if c2 else f" ({rsi_15m_val:.2f}) ❌"
     mark_3 = f" ({rsi_1h_val:.2f}) ✅" if c3 else f" ({rsi_1h_val:.2f}) ❌"
@@ -427,7 +376,6 @@ def trigger_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_
     """
     components.html(notification_js, height=0)
     st.toast(f"{alert_type}: {symbol} (Score: {score})", icon="🚀")
-
     send_telegram_alert(symbol, alert_type, ltp, sl1=sl1, sl2=sl2, score=score, chart_url=chart_url, vo_val=vo_val)
 
 # --- 3. SESSION STATE ---
@@ -512,7 +460,6 @@ def is_market_open():
     market_end = dtime(15, 30)
     return market_start <= now.time() <= market_end
 
-# --- Dynamic EMA Exit Monitor Engine ---
 def process_active_trade_exits(kite_inst, access_token, api_key):
     now_time = datetime.now(IST).time()
     active_trades = load_active_trades()
@@ -653,7 +600,6 @@ if 'access_token' in st.session_state:
         except Exception:
             continue
 
-    # READ GSHEET ALERT_LOG
     try:
         df_sheet_log = conn.read(worksheet="Alert_Log")
         if not df_sheet_log.empty:
@@ -711,7 +657,6 @@ if 'access_token' in st.session_state:
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
 
-            # Direct evaluation without lazy-blocking
             df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
             vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
             star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
@@ -777,7 +722,6 @@ if 'access_token' in st.session_state:
         except Exception:
             continue
 
-    # Execute active exit rules engine during live trading hours
     if market_active:
         process_active_trade_exits(st.session_state.kite, st.session_state.access_token, API_KEY)
 
@@ -904,6 +848,3 @@ if results:
     with t_log:
         if st.session_state.alerts_history:
             render_table(pd.DataFrame(st.session_state.alerts_history).iloc[::-1], tab_key="live_history")
-
-time.sleep(60)
-st.rerun()
