@@ -663,6 +663,19 @@ if 'access_token' in st.session_state:
         df_sheet_log = conn.read(worksheet="Alert_Log")
         if not df_sheet_log.empty:
             sheet_log_count = len(df_sheet_log)
+            
+            # Format Change % column from raw decimal (0.1504) to percentage string (15.04%)
+            if 'Change %' in df_sheet_log.columns:
+                def format_pct(val):
+                    try:
+                        v = float(val)
+                        if abs(v) <= 1.0 and v != 0:
+                            v = v * 100.0
+                        return f"{v:.2f}%"
+                    except (ValueError, TypeError):
+                        return str(val)
+
+                df_sheet_log['Change %'] = df_sheet_log['Change %'].apply(format_pct)
     except Exception:
         df_sheet_log = pd.DataFrame()
         sheet_log_count = 0
