@@ -546,26 +546,44 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
             continue
 
         df_15m = fetch_15m_candles(access_token, api_key, inst_token)
-        if df_15m is None or len(df_15m) < 15:
+        if df_15m is None or len(df_15m) < 35:
             continue
 
-        df_15m['ema5'] = df_15m['close'].ewm(span=5, adjust=False).mean()
+        # 1. Calculate 9 EMA on 15m Close Price
         df_15m['ema9'] = df_15m['close'].ewm(span=9, adjust=False).mean()
 
+        # 2. Calculate RSI(14) & RSI's 34 EMA Series
+        delta = df_15m['close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        alpha = 1.0 / 14.0
+        avg_gain = gain.ewm(alpha=alpha, min_periods=14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=alpha, min_periods=14, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, float('nan'))
+        df_15m['rsi'] = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+        df_15m['rsi_ema34'] = df_15m['rsi'].ewm(span=34, adjust=False).mean()
+
         last_close = df_15m['close'].iloc[-1]
-        last_ema5 = df_15m['ema5'].iloc[-1]
         last_ema9 = df_15m['ema9'].iloc[-1]
+        
+        last_rsi = df_15m['rsi'].iloc[-1]
+        last_rsi_ema = df_15m['rsi_ema34'].iloc[-1]
+        prev_rsi = df_15m['rsi'].iloc[-2]
+        prev_rsi_ema = df_15m['rsi_ema34'].iloc[-2]
+
         tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
 
+        # EXIT 1: RSI crosses below its 34 EMA on 15m TF
         if not data.get("exit1_triggered", False):
-            if last_close < last_ema5:
-                send_telegram_exit(sym, "EXIT 1", round(last_close, 2), chart_url=tv_url)
+            if (prev_rsi >= prev_rsi_ema) and (last_rsi < last_rsi_ema):
+                send_telegram_exit(sym, "EXIT 1 (RSI Cross Below 34 EMA)", round(last_close, 2), chart_url=tv_url)
                 data["exit1_triggered"] = True
                 updated = True
 
+        # FINAL EXIT: 15m Candle Close strictly below 9 EMA
         if not data.get("final_exit_triggered", False):
             if last_close < last_ema9:
-                send_telegram_exit(sym, "FINAL EXIT", round(last_close, 2), chart_url=tv_url)
+                send_telegram_exit(sym, "FINAL EXIT (Candle Close Below 9 EMA)", round(last_close, 2), chart_url=tv_url)
                 data["final_exit_triggered"] = True
                 del active_trades[sym]
                 updated = True
@@ -1011,7 +1029,7 @@ if results:
 
     # --- ACTIVE TRADES MONITORING SECTION ---
     st.divider()
-    st.header("🎯 Active Managed Trades (Dynamic EMA Exit Monitor)")
+    st.header("🎯 Active Managed Trades (Dynamic RSI & EMA Exit Monitor)")
     active_trades = load_active_trades()
 
     if active_trades:
@@ -1023,7 +1041,7 @@ if results:
                 "SL 1 (1.5 ATR)": tdata.get("sl1", 0.0),
                 "SL 2 (Pivot S1)": tdata.get("sl2", 0.0),
                 "Trigger Time": tdata.get("trigger_time", "").replace("T", " ")[:19],
-                "Exit 1 (Close < EMA5)": "⚠️ Triggered" if tdata.get("exit1_triggered") else "Active 🟢",
+                "Exit 1 (RSI < EMA34)": "⚠️ Triggered" if tdata.get("exit1_triggered") else "Active 🟢",
                 "Final Exit (Close < EMA9)": "❌ Closed" if tdata.get("final_exit_triggered") else "Holding 🟢",
                 "Chart": f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
             })
@@ -1050,3 +1068,4 @@ if results:
 
 else:
     st.info("Click 'Activate Session' or adjust sidebar filters to display market data.")
+
