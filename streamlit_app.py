@@ -650,7 +650,7 @@ if 'access_token' in st.session_state:
                             val_str = str(row.iloc[pct_col_idx]).replace('%', '').strip()
                             try:
                                 parsed_val = float(val_str)
-                                if abs(parsed_val) < 0.20 and parsed_val != 0:
+                                if abs(parsed_val) <= 1.0 and parsed_val != 0:
                                     parsed_val = parsed_val * 100.0
                                 gsheet_pct_map[s_clean] = parsed_val
                             except ValueError:
