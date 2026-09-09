@@ -260,11 +260,11 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
         if vol_sma20 > 0 and (curr_vol >= 2.5 * vol_sma20):
             c1 = True
 
-    # Star 2: 15m RSI >= 70 OR RSI > EMA(34)
-    if df_15m is not None and len(df_15m) >= 34:
-        rsi_15m_val, ema_15m = calculate_rsi_and_ema(df_15m['close'])
-        if rsi_15m_val >= 70 or rsi_15m_val > ema_15m:
-            c2 = True
+    # Star 2: 15m RSI between 70 and 80 OR RSI > EMA(34)
+        if df_15m is not None and len(df_15m) >= 34:
+            rsi_15m_val, ema_15m = calculate_rsi_and_ema(df_15m['close'])
+            if (70 < rsi_15m_val < 80) or rsi_15m_val > ema_15m:
+                c2 = True
 
     # Star 3: 1h RSI >= 70 OR RSI > EMA(34)
     if df_1h is not None and len(df_1h) >= 34:
