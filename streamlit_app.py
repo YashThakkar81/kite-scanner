@@ -664,6 +664,12 @@ if 'access_token' in st.session_state:
         if not df_sheet_log.empty:
             sheet_log_count = len(df_sheet_log)
             
+            # Step 1: Generate TradingView Chart URL for each Symbol
+            if 'Symbol' in df_sheet_log.columns:
+                df_sheet_log['Chart'] = df_sheet_log['Symbol'].apply(
+                    lambda sym: f"https://in.tradingview.com/chart/?symbol=NSE:{sym}"
+                )
+
             # Format Change % column from raw decimal (0.1504) to percentage string (15.04%)
             if 'Change %' in df_sheet_log.columns:
                 def format_pct(val):
@@ -971,7 +977,19 @@ if results:
     with t_gsheet_log:
         st.subheader("📋 Historical Google Sheets Alert Log")
         if not df_sheet_log.empty:
-            st.dataframe(df_sheet_log, use_container_width=True, hide_index=True)
+            st.data_editor(
+                df_sheet_log,
+                column_config={
+                    "Chart": st.column_config.LinkColumn(
+                        "Chart Link",
+                        display_text="View Chart 📈",
+                        help="Click to open TradingView chart"
+                    ),
+                },
+                hide_index=True,
+                disabled=True,
+                use_container_width=True
+            )
         else:
             st.info("No historical alerts found in GSheets.")
 
