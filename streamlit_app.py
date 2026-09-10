@@ -576,14 +576,14 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
         # EXIT 1: RSI crosses below its 34 EMA on 15m TF
         if not data.get("exit1_triggered", False):
             if (prev_rsi >= prev_rsi_ema) and (last_rsi < last_rsi_ema):
-                send_telegram_exit(sym, "EXIT 1 (RSI Cross Below 34 EMA)", round(last_close, 2), chart_url=tv_url)
+                send_telegram_exit(sym, "EXIT 1", round(last_close, 2), chart_url=tv_url)
                 data["exit1_triggered"] = True
                 updated = True
 
         # FINAL EXIT: 15m Candle Close strictly below 9 EMA
         if not data.get("final_exit_triggered", False):
             if last_close < last_ema9:
-                send_telegram_exit(sym, "FINAL EXIT (Candle Close Below 9 EMA)", round(last_close, 2), chart_url=tv_url)
+                send_telegram_exit(sym, "FINAL EXIT", round(last_close, 2), chart_url=tv_url)
                 data["final_exit_triggered"] = True
                 del active_trades[sym]
                 updated = True
