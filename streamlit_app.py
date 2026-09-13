@@ -133,13 +133,13 @@ def calculate_bb_median(df, length=20, offset=6):
     """
     if df is None or len(df) < (length + offset):
         return 0.0
-    
+
     # 20 SMA of Close Price
     sma_20 = df['close'].rolling(window=length).mean()
-    
+
     # Shift forward by offset (6 bars)
     bb_median_shifted = sma_20.shift(offset)
-    
+
     latest_val = bb_median_shifted.iloc[-1]
     return round(float(latest_val), 2) if pd.notna(latest_val) else 0.0
 
@@ -147,16 +147,16 @@ def calculate_bb_median(df, length=20, offset=6):
 def calculate_rsi_and_ema(series, period=14, ema_period=34):
     if len(series) < period + 1:
         return 50.0, 50.0
-    
+
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-    
+
     # Wilder's Exponential Smoothing (RMA) - Matches Kite / TradingView exactly
     alpha = 1.0 / period
     avg_gain = gain.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
-    
+
     rs = avg_gain / avg_loss.replace(0, float('nan'))
     rsi_series = 100.0 - (100.0 / (1.0 + rs))
     rsi_series = rsi_series.fillna(50.0)
@@ -216,6 +216,34 @@ def calculate_volume_oscillator(df, short_len=1, long_len=20):
     vo = ((last_short - last_long) / last_long) * 100.0
     return round(float(vo), 2)
 
+# --- VOLUME DISPLAY FORMATTING ---
+def format_volume_short(value):
+    try:
+        value = float(value)
+
+        # Hide invalid/missing average-volume sentinel
+        if value >= 999_999_999:
+            return "N/A"
+
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f} M"
+        elif value >= 1_000:
+            return f"{value / 1_000:.1f} K"
+        return f"{value:,.0f}"
+    except (ValueError, TypeError):
+        return "N/A"
+
+def format_volume_multiple(value):
+    try:
+        value = float(value)
+        if value > 0:
+            if value >= 2.5:
+                return f"{value:.1f}x 🟢"
+            return f"{value:.1f}x"
+        return "N/A"
+    except (ValueError, TypeError):
+        return "N/A"
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
     try:
@@ -249,7 +277,7 @@ def fetch_multi_timeframe_candles(access_token, api_key, instrument_token):
     except Exception:
         return None, None, None, None
 
-def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
+def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None, vol_multiple=None):
     c1, c2, c3, c4, c5 = False, False, False, False, False
     rsi_15m_val, rsi_1h_val, rsi_day_val, rsi_wk_val = 0.0, 0.0, 0.0, 0.0
 
@@ -261,10 +289,10 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
             c1 = True
 
     # Star 2: 15m RSI between 70 and 80 OR RSI > EMA(34)
-        if df_15m is not None and len(df_15m) >= 34:
-            rsi_15m_val, ema_15m = calculate_rsi_and_ema(df_15m['close'])
-            if (70 < rsi_15m_val < 80) or rsi_15m_val > ema_15m:
-                c2 = True
+    if df_15m is not None and len(df_15m) >= 34:
+        rsi_15m_val, ema_15m = calculate_rsi_and_ema(df_15m['close'])
+        if (70 < rsi_15m_val < 80) or rsi_15m_val > ema_15m:
+            c2 = True
 
     # Star 3: 1h RSI >= 70 OR RSI > EMA(34)
     if df_1h is not None and len(df_1h) >= 34:
@@ -287,13 +315,16 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
     score_num = sum([c1, c2, c3, c4, c5])
     score_plain = f"{score_num}/5"
 
-    # Volume Oscillator Formatting with Green Dot threshold (>= 150%)
+        # Daily Volume Oscillator with Green Dot threshold (>= 100%)
     if vol_osc_pct is not None and pd.notna(vol_osc_pct):
         vo_str = f"+{vol_osc_pct:.2f}%" if vol_osc_pct >= 0 else f"{vol_osc_pct:.2f}%"
-        if vol_osc_pct >= 150.0:
+        if vol_osc_pct >= 100.0:
             vo_str += " 🟢"
     else:
         vo_str = "N/A"
+
+    # Volume Multiple for the 5-Star popup
+    vol_multiple_str = format_volume_multiple(vol_multiple)
 
     # Pop-up Tooltip HTML with Exact RSI Values Preceding Pass/Fail Icons
     mark_1 = "✅" if c1 else "❌"
@@ -310,7 +341,8 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None):
         f'RSI 1h: {mark_3}<br>'
         f'RSI Daily: {mark_4}<br>'
         f'RSI Weekly: {mark_5}<br>'
-        f'VO: {vo_str}'
+        f'Vol Multiple: {vol_multiple_str}<br>'
+        f'Daily VO: {vo_str}'
         f'</span></div>'
     )
 
@@ -335,7 +367,7 @@ def send_telegram_raw(message):
 def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", chart_url="", vo_val=None):
     if vo_val is not None and pd.notna(vo_val):
         vo_str = f"+{vo_val:.2f}%" if vo_val >= 0 else f"{vo_val:.2f}%"
-        if vo_val >= 150.0:
+        if vo_val >= 100.0:
             vo_str += " 🟢"
     else:
         vo_str = "N/A"
@@ -346,7 +378,7 @@ def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", 
         message = (
             f"<b>HAPPY BREAKOUT: {symbol}</b>\n"
             f"Score: {score}\n"
-            f"VO: {vo_str}\n"
+            f"Daily VO: {vo_str}\n"
             f"Entry: ₹{ltp}\n"
             f"SL 1: ₹{sl1}\n"
             f"SL 2: ₹{sl2}\n"
@@ -356,7 +388,7 @@ def send_telegram_alert(symbol, alert_type, ltp, sl1=0.0, sl2=0.0, score="0/5", 
         message = (
             f"<b>{alert_type.upper()}: {symbol}</b>\n"
             f"Score: {score}\n"
-            f"VO: {vo_str}\n"
+            f"Daily VO: {vo_str}\n"
             f"Entry: ₹{ltp}\n"
             f"Chart: {chart_link}"
         )
@@ -442,17 +474,17 @@ def get_bb_status(df, ltp, length=20, offset=6):
 
     df_calc = df.iloc[-(length + offset):].copy()
     sma20 = df_calc['close'].rolling(window=length).mean()
-    
+
     current_bb_med = sma20.iloc[-1]
     prev_bb_med = sma20.iloc[-2] if len(sma20) >= 2 else current_bb_med
     prev_close = df_calc['close'].iloc[-2] if len(df_calc) >= 2 else ltp
-    
+
     if pd.isna(current_bb_med) or current_bb_med == 0:
         return "Below 🔴", False, False
 
     is_above = ltp > current_bb_med
     is_cross_above = (prev_close <= prev_bb_med) and (ltp > current_bb_med)
-    
+
     dist_pct = ((ltp - current_bb_med) / current_bb_med) * 100.0
     is_support = (0.0 <= dist_pct <= 0.5)
 
@@ -500,6 +532,48 @@ def get_daily_avg_vol(access_token, api_key, symbols):
         try:
             quotes = kite_inst.quote(chunk)
             with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(process_symbol, s, quotes.get(s)) for s in chunk]
+                for f in futures:
+                    sym, vol_val = f.result()
+                    avg_vol_map[sym] = vol_val
+        except Exception:
+            pass
+    return avg_vol_map
+
+# --- 20-PERIOD DAILY AVERAGE VOLUME FOR DISPLAY / VOLUME MULTIPLE ---
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_daily_avg_vol_20(access_token, api_key, symbols):
+    kite_inst = KiteConnect(api_key=api_key)
+    kite_inst.set_access_token(access_token)
+    avg_vol_map = {}
+    to_date = datetime.now(IST).date()
+    from_date = to_date - timedelta(days=45)
+
+    def process_symbol(s, q):
+        try:
+            if q and 'instrument_token' in q:
+                hist = kite_inst.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
+                
+                if hist and len(hist) > 0:
+                    recent_hist = hist[-20:]
+                    vols = [day['volume'] for day in recent_hist if 'volume' in day]
+                    if vols:
+                        return s, sum(vols) / len(vols)
+            
+            if q and q.get('average_quantity', 0) > 0:
+                return s, float(q['average_quantity'])
+                
+            return s, 999999999
+        except Exception:
+            if q and q.get('average_quantity', 0) > 0:
+                return s, float(q['average_quantity'])
+            return s, 999999999
+
+    for i in range(0, len(symbols), 100):
+        chunk = symbols[i:i+100]
+        try:
+            quotes = kite_inst.quote(chunk)
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(process_symbol, s, quotes.get(s)) for s in chunk]
                 for f in futures:
                     sym, vol_val = f.result()
@@ -565,7 +639,7 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
 
         last_close = df_15m['close'].iloc[-1]
         last_ema9 = df_15m['ema9'].iloc[-1]
-        
+
         last_rsi = df_15m['rsi'].iloc[-1]
         last_rsi_ema = df_15m['rsi_ema34'].iloc[-1]
         prev_rsi = df_15m['rsi'].iloc[-2]
@@ -596,7 +670,7 @@ with st.sidebar:
     st.header("🕒 Scanner Status")
     now_ist = datetime.now(IST)
     st.info(f"Last Updated: {now_ist.strftime('%H:%M:%S')}")
-    
+
     market_active = is_market_open()
     if market_active:
         st.success("Market Status: OPEN (Live Refresh Active) 🟢")
@@ -681,7 +755,7 @@ if 'access_token' in st.session_state:
         df_sheet_log = conn.read(worksheet="Alert_Log")
         if not df_sheet_log.empty:
             sheet_log_count = len(df_sheet_log)
-            
+
             # Step 1: Generate TradingView Chart URL for each Symbol
             if 'Symbol' in df_sheet_log.columns:
                 df_sheet_log['Chart'] = df_sheet_log['Symbol'].apply(
@@ -721,6 +795,7 @@ if 'access_token' in st.session_state:
         st.stop()
 
     avg_vols = get_daily_avg_vol(st.session_state.access_token, API_KEY, symbols)
+    avg_vols_20 = get_daily_avg_vol_20(st.session_state.access_token, API_KEY, symbols)
     results = []
 
     try:
@@ -749,6 +824,7 @@ if 'access_token' in st.session_state:
                 pct = 0.0
 
             avg_v = avg_vols.get(s, 0)
+            avg_v_20 = avg_vols_20.get(s, 0)
 
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
@@ -756,11 +832,21 @@ if 'access_token' in st.session_state:
             # LAZY EVALUATION
             should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k
 
+            # Volume Multiple is based on current daily volume vs 20-period daily average volume.
+            vol_multiple = (vol / avg_v_20) if avg_v_20 > 0 and avg_v_20 < 999999999 else 0.0
+
             if should_evaluate:
                 df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
-                vol_osc_pct = calculate_volume_oscillator(df_15m, short_len=1, long_len=20)
-                star_score_plain, star_score_html = calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=vol_osc_pct)
-                
+                vol_osc_pct = calculate_volume_oscillator(df_day, short_len=1, long_len=20)
+                star_score_plain, star_score_html = calculate_5star_score(
+                    df_15m,
+                    df_1h,
+                    df_day,
+                    df_week,
+                    vol_osc_pct=vol_osc_pct,
+                    vol_multiple=vol_multiple
+                )
+
                 # Donchian 15m Status
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
                 dc_short_status = dc_status.replace("🚀 UPPER BREAKOUT", "🚀 UB")
@@ -835,11 +921,13 @@ if 'access_token' in st.session_state:
                 "BB Med 1H": bb_1h_status,
                 "BB Med Day": bb_day_status,
                 "BB Med Wk": bb_wk_status,
-                "Vol Osc %": vol_osc_pct,
+                "Daily VO %": vol_osc_pct,
                 "Vol Status": vol_status_label,
                 "DC 15m": dc_short_status,
                 "Chart": tv_url,
-                "Volume": vol
+                "Volume": format_volume_short(vol),
+                "Avg Volume": format_volume_short(avg_v_20),
+                "Vol Multiple": format_volume_multiple(vol_multiple)
             })
         except Exception:
             continue
@@ -890,7 +978,7 @@ if results:
 
     combo_count = len(df_combo)
     early_count = len(df_early)
-    vol_count = len(df_display[df_display['Vol Osc %'] > 0]) if 'Vol Osc %' in df_display.columns else 0
+    vol_count = len(df_display[df_display['Daily VO %'] > 0]) if 'Daily VO %' in df_display.columns else 0
     dc_count = len(df_display[df_display['DC 15m'].astype(str).str.contains("🚀", na=False)]) if 'DC 15m' in df_display.columns else 0
     history_count = len(st.session_state.alerts_history)
 
@@ -924,7 +1012,10 @@ if results:
         "BB Med 1H": st.column_config.NumberColumn("BB Med 1H", format="₹%.2f"),
         "BB Med Day": st.column_config.TextColumn("BB Med Day"),
         "BB Med Wk": st.column_config.TextColumn("BB Med Wk"),
-        "Vol Osc %": st.column_config.NumberColumn("Vol Osc %", format="%.2f%%"),
+        "Daily VO %": st.column_config.NumberColumn("Daily VO %", format="%.2f%%"),
+        "Volume": st.column_config.TextColumn("Volume"),
+        "Avg Volume": st.column_config.TextColumn("Avg Volume"),
+        "Vol Multiple": st.column_config.TextColumn("Vol Multiple"),
         "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV ↗")
     }
 
@@ -937,10 +1028,10 @@ if results:
         df_calc = df_to_render.copy()
         if 'Chart' in df_calc.columns:
             df_calc['Chart'] = df_calc['Chart'].apply(lambda x: f'<a href="{x}" target="_blank">Open TV ↗</a>')
-        
-        if 'Vol Osc %' in df_calc.columns:
-            df_calc['Vol Osc %'] = df_calc['Vol Osc %'].apply(
-                lambda x: f"+{x:.2f}% 🟢" if isinstance(x, (int, float)) and x >= 150.0 else (f"{x:.2f}%" if isinstance(x, (int, float)) else str(x))
+
+        if 'Daily VO %' in df_calc.columns:
+            df_calc['Daily VO %'] = df_calc['Daily VO %'].apply(
+                lambda x: f"+{x:.2f}% 🟢" if isinstance(x, (int, float)) and x >= 100.0 else (f"{x:.2f}%" if isinstance(x, (int, float)) else str(x))
             )
 
         html_code = df_calc.to_html(escape=False, index=False, classes="custom-table")
@@ -955,7 +1046,7 @@ if results:
         df_calc = df_to_render.copy()
         if 'Score' in df_calc.columns:
             df_calc['Score'] = df_calc['Score'].apply(lambda x: str(x).rsplit('>', 1)[-1] if '>' in str(x) else str(x))
-        
+
         st.dataframe(
             df_calc,
             column_config=col_config,
@@ -980,11 +1071,13 @@ if results:
 
     with t_main:
         st.subheader("📊 Full Market Overview")
-        display_data(df_display)
+        # TASK 1: Hide only Vol Status from the main Market table.
+        df_main_display = df_display.drop(columns=["Vol Status"], errors="ignore")
+        display_data(df_main_display)
 
     with t_vol:
         st.subheader("🔥 High Volume Oscillator Filter")
-        df_vol_filtered = df_display[df_display['Vol Osc %'] > 0] if 'Vol Osc %' in df_display.columns else pd.DataFrame()
+        df_vol_filtered = df_display[df_display['Daily VO %'] > 0] if 'Daily VO %' in df_display.columns else pd.DataFrame()
         display_data(df_vol_filtered)
 
     with t_dc:
@@ -1045,7 +1138,7 @@ if results:
                 "Final Exit (Close < EMA9)": "❌ Closed" if tdata.get("final_exit_triggered") else "Holding 🟢",
                 "Chart": f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
             })
-        
+
         df_active = pd.DataFrame(active_rows)
         st.dataframe(
             df_active,
@@ -1058,7 +1151,7 @@ if results:
             hide_index=True,
             use_container_width=True
         )
-        
+
         if st.button("Reset Active Trades Log", type="secondary"):
             save_active_trades({})
             st.success("Active trades cleared successfully.")
@@ -1068,4 +1161,3 @@ if results:
 
 else:
     st.info("Click 'Activate Session' or adjust sidebar filters to display market data.")
-
