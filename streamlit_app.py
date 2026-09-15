@@ -540,30 +540,48 @@ def get_daily_avg_vol(access_token, api_key, symbols):
             pass
     return avg_vol_map
 
-# --- 20-PERIOD DAILY AVERAGE VOLUME FOR DISPLAY / VOLUME MULTIPLE ---
-@st.cache_data(ttl=86400, show_spinner=False)
+# --- LIVE 20-PERIOD DAILY AVERAGE VOLUME (19 COMPLETED DAYS + TODAY LIVE) ---
+@st.cache_data(ttl=60, show_spinner=False)
 def get_daily_avg_vol_20(access_token, api_key, symbols):
     kite_inst = KiteConnect(api_key=api_key)
     kite_inst.set_access_token(access_token)
     avg_vol_map = {}
+
     to_date = datetime.now(IST).date()
     from_date = to_date - timedelta(days=45)
 
     def process_symbol(s, q):
         try:
             if q and 'instrument_token' in q:
-                hist = kite_inst.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
-                
+                # Fetch completed daily candles + today's live daily candle
+                hist = kite_inst.historical_data(
+                    q['instrument_token'],
+                    from_date,
+                    to_date,
+                    "day"
+                )
+
                 if hist and len(hist) > 0:
+                    # Use the latest 20 daily volumes, including today's live volume
                     recent_hist = hist[-20:]
-                    vols = [day['volume'] for day in recent_hist if 'volume' in day]
+                    vols = [
+                        day['volume']
+                        for day in recent_hist
+                        if 'volume' in day and day['volume'] is not None
+                    ]
+
+                    if len(vols) >= 20:
+                        return s, sum(vols) / 20
+
                     if vols:
                         return s, sum(vols) / len(vols)
-            
+
+            # Fallback to Kite quote average quantity
             if q and q.get('average_quantity', 0) > 0:
                 return s, float(q['average_quantity'])
-                
+
             return s, 999999999
+
         except Exception:
             if q and q.get('average_quantity', 0) > 0:
                 return s, float(q['average_quantity'])
@@ -571,15 +589,23 @@ def get_daily_avg_vol_20(access_token, api_key, symbols):
 
     for i in range(0, len(symbols), 100):
         chunk = symbols[i:i+100]
+
         try:
             quotes = kite_inst.quote(chunk)
+
             with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [executor.submit(process_symbol, s, quotes.get(s)) for s in chunk]
+                futures = [
+                    executor.submit(process_symbol, s, quotes.get(s))
+                    for s in chunk
+                ]
+
                 for f in futures:
                     sym, vol_val = f.result()
                     avg_vol_map[sym] = vol_val
+
         except Exception:
             pass
+
     return avg_vol_map
 
 # --- 5. MARKET HOURS UTILITY ---
