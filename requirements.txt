@@ -5,3 +5,4 @@ kiteconnect
 st-gsheets-connection
 pytz
 requests
+streamlit-autorefresh
