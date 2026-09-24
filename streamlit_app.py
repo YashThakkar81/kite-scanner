@@ -109,15 +109,27 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 # ================================================================
 # Telegram/PC alert tier configuration
 # ================================================================
-# Early Watchlist and Happy Breakout share 5 conditions (price move,
-# Donchian breakout, Daily VO%, and RSI-vs-its-own-EMA34), differing only
-# on how strict the volume/RSI thresholds are. Happy Breakout is the
-# priority tier — it's checked first every cycle; Early Watchlist is only
-# checked if Happy Breakout didn't already fire this cycle for that symbol.
+# Happy Breakout is the priority tier — it's checked first every cycle —
+# and still uses its original 8 conditions (price move, volume multiple +
+# minimum volume, 15m Donchian breakout, 15m RSI, Daily VO%, RSI-vs-its-
+# own-EMA34). Early Watchlist is checked only if Happy Breakout didn't
+# already fire this cycle for that symbol, but its LOGIC now mirrors the
+# Google Sheet's "PDH Break" page instead of its old Donchian/RSI/VO%-based
+# conditions: it fires the instant today's High trades at or above the
+# previous trading day's High AND Volume Multiple exceeds
+# PDH_VOL_MULTIPLE_THRESHOLD — nothing else gates it (no RSI, no Donchian,
+# no Daily VO%, no Change % requirement), exactly like the Sheet's PDH
+# Break scan. See is_early_watchlist below. The "Early Watchlist" name is
+# unchanged everywhere (toggle, Telegram alerts, active-trade dedup,
+# dashboard tab).
 #
 # NOTE: SL conditions were intentionally removed entirely — exits are now
 # handled purely by the two-stage EMA exit engine below, not by price-based
 # stop levels.
+
+# LEGACY (no longer used by is_early_watchlist — kept only for reference/
+# history; the Early Watchlist condition now uses PDH_VOL_MULTIPLE_THRESHOLD
+# instead). See the "PDH BREAK MIRROR" comment further down.
 EARLY_WATCHLIST_VOL_MULTIPLE = 1.1
 EARLY_WATCHLIST_MIN_VOLUME = 100_000
 EARLY_WATCHLIST_RSI_THRESHOLD = 65
@@ -127,7 +139,13 @@ HAPPY_BREAKOUT_MIN_VOLUME = 500_000
 HAPPY_BREAKOUT_RSI_THRESHOLD = 70
 
 DAILY_VO_THRESHOLD = 100.0
-PRICE_MOVE_PCT_THRESHOLD = 1.0  # vs PrevClose, matches existing "pct" field
+PRICE_MOVE_PCT_THRESHOLD = 1.0  # vs PrevClose, matches existing "pct" field; used by Happy Breakout only
+
+# PDH BREAK MIRROR — same threshold and meaning as the Google Sheet's
+# PDH_VOL_MULTIPLE_THRESHOLD (Master Key script, PDH Break section): Volume
+# Multiple (today's volume ÷ 20-day avg volume incl. today's live volume)
+# must exceed this for the PDH-break condition to be able to fire.
+PDH_VOL_MULTIPLE_THRESHOLD = 1.5
 
 EARLY_WATCHLIST_EMOJI = "🚩"
 HAPPY_BREAKOUT_EMOJI = "🟢"
@@ -450,6 +468,31 @@ def get_donchian_status(df, length=28, offset=6):
     status_str = "🚀 UPPER BREAKOUT" if is_breakout else "Below"
     return status_str, is_breakout
 
+# ================================================================
+# PREVIOUS DAY HIGH — mirrors the Google Sheet's PDH Break scan
+# (fetchPreviousDayHigh_ / getCachedPreviousDayHigh_ in the Apps Script).
+# ================================================================
+# Returns the High of the most recent COMPLETED trading day (i.e.
+# "yesterday's" High), reusing the same daily candles (df_day) already
+# downloaded for Daily VO % — no extra API call needed. Skips today's
+# still-forming candle the same way the Apps Script does (filters out any
+# candle whose date matches today_key before taking the last remaining
+# row's High). Returns 0.0 if no completed day is available yet, exactly
+# like the Sheet leaves a symbol un-triggered until its PDH is known.
+def get_previous_day_high(df_day, today_key):
+    if df_day is None or df_day.empty:
+        return 0.0
+    try:
+        dates = df_day['date'].apply(
+            lambda d: (d if isinstance(d, str) else d.strftime('%Y-%m-%d'))[:10]
+        )
+        completed = df_day[dates != today_key]
+        if completed.empty:
+            return 0.0
+        return float(completed['high'].iloc[-1])
+    except Exception:
+        return 0.0
+
 def get_bb_status(df, ltp, length=20, offset=6):
     """
     Calculates BB Median status:
@@ -636,18 +679,75 @@ def is_market_open():
 # ================================================================
 # Two-stage EMA-only exit engine (no SL, no forced end-of-day close)
 # ================================================================
-# Exit 1: 15m close crosses BELOW its 9-EMA (on the last CLOSED candle).
-#         Fires once, sends a Telegram alert, but the symbol STAYS in
-#         active_trades — still being watched for Final Exit.
-# Final Exit: 15m close is below its 21-EMA (on the last CLOSED candle).
-#         Fires once, sends a Telegram alert, and REMOVES the symbol from
-#         active_trades entirely — this is what frees it to fire a brand
-#         new Happy Breakout / Early Watchlist alert later if conditions
-#         become true again.
+# Exit 1: 15m close crosses BELOW a buffered 9-EMA line (on the last CLOSED
+#         candle) — see ATR_EXIT1_MULTIPLIER below. Fires once, sends a
+#         Telegram alert, but the symbol STAYS in active_trades — still
+#         being watched for Final Exit.
+# Final Exit: 15m close is below its plain 21-EMA (on the last CLOSED
+#         candle) — UNCHANGED, no buffer. Fires once, sends a Telegram
+#         alert, and REMOVES the symbol from active_trades entirely — this
+#         is what frees it to fire a brand new Happy Breakout / Early
+#         Watchlist alert later if conditions become true again.
 # There is no forced 15:15 end-of-day close: since the 15-min candle
 # series is a continuous multi-day rolling window, these two conditions
 # simply keep watching the same position into the next trading session.
-def process_active_trade_exits(kite_inst, access_token, api_key):
+#
+# ATR CONFIRMATION BUFFER ON EXIT 1 (new): a bare EMA9 touch/cross on a
+# 15-min candle is noisy — normal EMA-hugging chop can trip it constantly,
+# especially now that Early Watchlist (PDH Break mirror) adds more symbols
+# to active_trades than before. Instead of firing the instant the close
+# dips under EMA9, Exit 1 now requires the close to clear EMA9 by at least
+# ATR_EXIT1_MULTIPLIER × the 15m ATR(14) (Wilder-smoothed, same smoothing
+# convention as calculate_rsi_and_ema's avg_gain/avg_loss elsewhere in this
+# file) before it counts as a real break, not just noise. ATR scales the
+# buffer to each symbol's own recent volatility (a calm large-cap and a
+# choppy small-cap get proportionally different buffers) rather than using
+# one flat % for every symbol. The crossover framing is preserved — Exit 1
+# still fires on the transition from "at/above the buffered line" to
+# "below the buffered line" between the previous and current closed
+# candle, it just uses the buffered line instead of the raw EMA9. Final
+# Exit is intentionally left untouched (plain 21-EMA, no buffer) — it's
+# already the slower/smoother of the two and is meant to mean "the
+# position is done".
+#
+# Both alert stages can now be toggled independently from the sidebar
+# (notify_exit1 / notify_final_exit): turning a toggle off pauses that
+# stage's evaluation (no alert, no state change) without touching the
+# other stage or any other logic in this file.
+ATR_EXIT1_MULTIPLIER = 0.4  # k in "close must clear EMA9 by k × ATR14" — tune here if needed
+
+
+def calculate_atr_series(df, period=14):
+    """
+    Wilder-smoothed Average True Range (alpha = 1/period), matching the same
+    smoothing convention already used by calculate_rsi_and_ema's avg_gain /
+    avg_loss elsewhere in this file. Returns the FULL series (not just the
+    latest value) so callers can index it at the same "last CLOSED candle"
+    position used for EMA9/EMA21 (see get_last_closed_candle_index) — never
+    the still-forming candle. Returns None if there isn't enough data yet.
+    """
+    if df is None or len(df) < period + 1:
+        return None
+
+    high = df['high']
+    low = df['low']
+    prev_close = df['close'].shift(1)
+
+    true_range = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    return true_range.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def process_active_trade_exits(kite_inst, access_token, api_key, notify_exit1=True, notify_final_exit=True):
+    # Both exit alert stages off: skip entirely, no point fetching candles
+    # for a check that won't alert either way.
+    if not notify_exit1 and not notify_final_exit:
+        return
+
     active_trades = load_active_trades()
     if not active_trades:
         return
@@ -664,6 +764,7 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
 
         df_15m['ema9'] = df_15m['close'].ewm(span=9, adjust=False).mean()
         df_15m['ema21'] = df_15m['close'].ewm(span=21, adjust=False).mean()
+        atr_series = calculate_atr_series(df_15m, period=14)  # reuses df_15m — zero extra API calls
 
         closed_idx = get_last_closed_candle_index(df_15m, interval_minutes=15)
         if closed_idx is None or closed_idx < 1:
@@ -676,17 +777,32 @@ def process_active_trade_exits(kite_inst, access_token, api_key):
         prev_close = df_15m['close'].iloc[closed_idx - 1]
         prev_ema9 = df_15m['ema9'].iloc[closed_idx - 1]
 
+        # ATR at the same closed-candle positions as the EMA reads above —
+        # 0.0 (no buffer) if ATR isn't available yet (insufficient history).
+        atr_now = 0.0
+        atr_prev = 0.0
+        if atr_series is not None:
+            if closed_idx < len(atr_series) and pd.notna(atr_series.iloc[closed_idx]):
+                atr_now = float(atr_series.iloc[closed_idx])
+            if (closed_idx - 1) < len(atr_series) and pd.notna(atr_series.iloc[closed_idx - 1]):
+                atr_prev = float(atr_series.iloc[closed_idx - 1])
+
+        exit1_line_now = last_ema9 - (ATR_EXIT1_MULTIPLIER * atr_now)
+        exit1_line_prev = prev_ema9 - (ATR_EXIT1_MULTIPLIER * atr_prev)
+
         tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
 
-        # EXIT 1: crossover below the 9-EMA — warning stage, stays active.
-        if not data.get("exit1_triggered", False):
-            if (prev_close >= prev_ema9) and (last_close < last_ema9):
+        # EXIT 1: crossover below the ATR-buffered 9-EMA line — warning
+        # stage, stays active. Gated by the sidebar toggle.
+        if notify_exit1 and not data.get("exit1_triggered", False):
+            if (prev_close >= exit1_line_prev) and (last_close < exit1_line_now):
                 send_telegram_exit(sym, "EXIT 1", round(last_close, 2), chart_url=tv_url)
                 data["exit1_triggered"] = True
                 updated = True
 
-        # FINAL EXIT: close below the 21-EMA — removes the position entirely.
-        if not data.get("final_exit_triggered", False):
+        # FINAL EXIT: close below the plain 21-EMA (unchanged, no ATR
+        # buffer) — removes the position entirely. Gated by its own toggle.
+        if notify_final_exit and not data.get("final_exit_triggered", False):
             if last_close < last_ema21:
                 send_telegram_exit(sym, "FINAL EXIT", round(last_close, 2), chart_url=tv_url)
                 del active_trades[sym]
@@ -724,19 +840,47 @@ with st.sidebar:
         )
     )
     notify_early = st.toggle(
-        f"Enable Early Watchlist {EARLY_WATCHLIST_EMOJI} ({EARLY_WATCHLIST_VOL_MULTIPLE}x Avg Vol + "
-        f">{format_volume_short(EARLY_WATCHLIST_MIN_VOLUME)} + RSI>{EARLY_WATCHLIST_RSI_THRESHOLD} + VO\u2265100%)",
+        f"Enable Early Watchlist {EARLY_WATCHLIST_EMOJI} (PDH Break: High \u2265 Prev Day High + "
+        f"Vol Multiple > {PDH_VOL_MULTIPLE_THRESHOLD}x)",
         value=True,
         help=(
-            f"Price \u2265{PRICE_MOVE_PCT_THRESHOLD}% vs PrevClose, Volume > {EARLY_WATCHLIST_VOL_MULTIPLE}x 20-day "
-            f"Avg Volume AND > {EARLY_WATCHLIST_MIN_VOLUME:,} shares, 15m Donchian Upper Breakout, "
-            f"15m RSI > {EARLY_WATCHLIST_RSI_THRESHOLD} AND RSI > its own 34-EMA, Daily Volume Oscillator "
-            f"(1,20) \u2265 +100%. Lower-conviction / early-entry tier \u2014 only checked if Happy Breakout "
-            f"didn't already fire this cycle."
+            f"Mirrors the Google Sheet's \u2018PDH Break\u2019 page: fires the instant today's High "
+            f"trades at or above the previous trading day's High, AND Volume Multiple (today's volume "
+            f"\u00f7 20-day Avg Volume incl. today's live volume) exceeds {PDH_VOL_MULTIPLE_THRESHOLD}x. "
+            f"Nothing else gates it \u2014 no RSI, no 15m Donchian breakout, no Daily Volume Oscillator, "
+            f"and no Change % requirement \u2014 so it can fire with essentially zero lag, independently "
+            f"of Happy Breakout. Only checked if Happy Breakout didn't already fire this cycle for that "
+            f"symbol. No SL is shown; exits are handled by the 9/21-EMA exit engine."
         )
     )
     notify_vol = st.toggle("Enable Individual Volume Alerts", value=False)
     notify_dc = st.toggle("Enable Individual Donchian Alerts", value=False)
+
+    st.divider()
+    st.header("🚪 Exit Alert Controls")
+    notify_exit1 = st.toggle(
+        f"Enable Exit 1 Alerts (15m close < EMA9 − {ATR_EXIT1_MULTIPLIER}×ATR14)",
+        value=False,
+        help=(
+            f"Early-warning exit stage only — the position stays in Active Managed Trades and is "
+            f"still watched for Final Exit. Requires the 15m closed candle to close BELOW EMA9 by at "
+            f"least {ATR_EXIT1_MULTIPLIER}× the 15m ATR(14) (Wilder-smoothed), instead of a bare EMA "
+            f"touch, so Exit 1 doesn't fire on ordinary EMA-hugging noise. Fires once per trade "
+            f"lifecycle. Turn this off to silence Exit 1 alerts entirely — Final Exit keeps working "
+            f"independently."
+        )
+    )
+    notify_final_exit = st.toggle(
+        "Enable Final Exit Alerts (15m close < EMA21)",
+        value=False,
+        help=(
+            "Removes the symbol from Active Managed Trades entirely, freeing it to fire a brand-new "
+            "Happy Breakout / Early Watchlist alert later if conditions become true again. Logic is "
+            "unchanged — plain close below the 21-EMA on the last closed 15m candle, no ATR buffer. "
+            "Turn this off to stop positions from being auto-closed — they simply stay listed under "
+            "Active Managed Trades until you turn this back on or reset the log manually."
+        )
+    )
 
     if 'access_token' in st.session_state:
         st.divider()
@@ -873,6 +1017,7 @@ if 'access_token' in st.session_state:
                 continue
 
             ltp, vol, cl = q['last_price'], q['volume'], q['ohlc']['close']
+            today_high = q['ohlc']['high']  # used by the PDH-Break-mirrored Early Watchlist condition below
             sym_short = s.replace("NSE:", "")
 
             if cl > 0:
@@ -888,14 +1033,21 @@ if 'access_token' in st.session_state:
             is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 500000)
             is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
 
-            # LAZY EVALUATION
-            should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k
-
             # Volume Multiple is based on current daily volume vs 20-period daily average volume.
+            # Computed BEFORE the lazy-evaluation gate below (avg_v_20 comes from the separately
+            # cached get_daily_avg_vol_20() call, not from the multi-timeframe candle fetch), so a
+            # symbol with a high Volume Multiple but Change % < 1% can still qualify for a full
+            # candle fetch — this is what lets the PDH-Break-mirrored Early Watchlist condition
+            # below evaluate independently of Change %, exactly like the Google Sheet's PDH Break
+            # scan (see PDH_VOL_MULTIPLE_THRESHOLD).
             vol_multiple = (vol / avg_v_20) if avg_v_20 > 0 and avg_v_20 < 999999999 else 0.0
+            is_vol_multiple_high = vol_multiple > PDH_VOL_MULTIPLE_THRESHOLD
+
+            # LAZY EVALUATION
+            should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k or is_vol_multiple_high
 
             rsi_15m_val = 0.0
-            rsi_15m_ema34 = 0.0  # used only by the Early Watchlist / Happy Breakout alert conditions below
+            rsi_15m_ema34 = 0.0  # used only by the Happy Breakout alert condition below
 
             if should_evaluate:
                 df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
@@ -909,8 +1061,8 @@ if 'access_token' in st.session_state:
                     vol_multiple=vol_multiple
                 )
 
-                # Independent RSI/EMA34 read, used only for alert
-                # conditions — kept separate from the Score/tooltip logic
+                # Independent RSI/EMA34 read, used only for the Happy Breakout
+                # alert condition — kept separate from the Score/tooltip logic
                 # above so the dashboard table's Score column is untouched.
                 if df_15m is not None and len(df_15m) >= 34:
                     _, rsi_15m_ema34 = calculate_rsi_and_ema(df_15m['close'])
@@ -926,6 +1078,13 @@ if 'access_token' in st.session_state:
                 bb_1h_status,  _, _ = get_bb_status(df_1h, ltp)
                 bb_day_status, _, _ = get_bb_status(df_day, ltp)
                 bb_wk_status,  _, _ = get_bb_status(df_week, ltp)
+
+                # Previous Day High — mirrors the Google Sheet's PDH Break scan
+                # (fetchPreviousDayHigh_ / getCachedPreviousDayHigh_): the High of
+                # the most recent COMPLETED trading day, from the same daily
+                # candles already downloaded above for Daily VO % — no extra API
+                # call needed.
+                pdh_value = get_previous_day_high(df_day, now_ist.strftime("%Y-%m-%d"))
             else:
                 vol_osc_pct = 0.0
                 star_score_plain, star_score_html = "0/5", '<div class="score-tooltip">0/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">Not Evaluated</div></div>'
@@ -933,6 +1092,7 @@ if 'access_token' in st.session_state:
                 dc_short_status, is_dc_breakout = "Below", False
                 bb_15m_status, bb_1h_status = "Below 🔴", "Below 🔴"
                 bb_day_status, bb_wk_status = "Below 🔴", "Below 🔴"
+                pdh_value = 0.0  # not known yet — this symbol is simply judged again on the next refresh
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
 
@@ -953,15 +1113,21 @@ if 'access_token' in st.session_state:
                 and rsi_above_own_ema
             )
 
+            # PDH BREAK MIRROR (replaces the old Donchian/RSI/VO%-based Early
+            # Watchlist condition): trigger the instant today's High trades at
+            # or above the previous trading day's High AND Volume Multiple
+            # (today's volume ÷ 20-day avg volume incl. today's live volume)
+            # exceeds PDH_VOL_MULTIPLE_THRESHOLD — exactly the Google Sheet's
+            # "PDH Break" page (runPdhBreakScan_ / PDH_VOL_MULTIPLE_THRESHOLD).
+            # Intentionally independent of RSI, Donchian, Daily VO%, and
+            # Change % — none of those gate this tier, same as the Sheet. The
+            # "Early Watchlist" name is kept unchanged everywhere below
+            # (toggle, Telegram, active-trade dedup, dashboard tab).
             is_early_watchlist = (
                 avg_v_20 > 0 and avg_v_20 < 999999999
-                and vol_multiple > EARLY_WATCHLIST_VOL_MULTIPLE
-                and vol > EARLY_WATCHLIST_MIN_VOLUME
-                and pct >= PRICE_MOVE_PCT_THRESHOLD
-                and is_dc_breakout
-                and rsi_15m_val > EARLY_WATCHLIST_RSI_THRESHOLD
-                and vo_ok
-                and rsi_above_own_ema
+                and vol_multiple > PDH_VOL_MULTIPLE_THRESHOLD
+                and pdh_value > 0
+                and today_high >= pdh_value
             )
 
             # Persistent, exit-gated dedup: a tier only fires once per
@@ -1046,9 +1212,9 @@ if 'access_token' in st.session_state:
                 # this tab's filter logic is independent of the alert conditions above.
                 "_vol_multiple_raw": vol_multiple,
                 "_rsi_15m": rsi_15m_val,
-                # NEW: the actual current Early Watchlist alert condition for this row
-                # (same boolean used for Telegram/PC alerts), used only to power the
-                # new Early Watchlist dashboard tab below.
+                # The actual current Early Watchlist alert condition for this row (same
+                # boolean used for Telegram/PC alerts — now the PDH-Break mirror), used
+                # only to power the Early Watchlist dashboard tab below.
                 "_is_early_watchlist": is_early_watchlist
             })
         except Exception:
@@ -1056,7 +1222,10 @@ if 'access_token' in st.session_state:
 
     # Execute active exit rules engine during live trading hours
     if market_active:
-        process_active_trade_exits(st.session_state.kite, st.session_state.access_token, API_KEY)
+        process_active_trade_exits(
+            st.session_state.kite, st.session_state.access_token, API_KEY,
+            notify_exit1=notify_exit1, notify_final_exit=notify_final_exit
+        )
 
     # --- 8. DASHBOARD DISPLAY ---
 
@@ -1101,10 +1270,11 @@ if 'access_token' in st.session_state:
             & (df_display['Daily VO %'] >= 100.0)
         ].copy()
 
-        # NEW: Early Watchlist tab — filtered on the exact same boolean used
-        # for the Telegram/PC Early Watchlist alerts (1.1x Avg Vol + >100K,
-        # RSI>65, Donchian breakout, Daily VO%>=100%, RSI > its own 34-EMA).
-        # Independent of df_combo's (unchanged, legacy) Happy Breakout filter.
+        # Early Watchlist tab — filtered on the exact same boolean used for
+        # the Telegram/PC Early Watchlist alerts (now the PDH-Break mirror:
+        # today's High \u2265 Previous Day High AND Volume Multiple >
+        # PDH_VOL_MULTIPLE_THRESHOLD). Independent of df_combo's (unchanged,
+        # legacy) Happy Breakout filter.
         df_early = df_display[df_display['_is_early_watchlist'] == True].copy()
 
         # Clean temporary/hidden helper columns before anything gets displayed
