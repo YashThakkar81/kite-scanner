@@ -113,15 +113,15 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 # and still uses its original 8 conditions (price move, volume multiple +
 # minimum volume, 15m Donchian breakout, 15m RSI, Daily VO%, RSI-vs-its-
 # own-EMA34). Early Watchlist is checked only if Happy Breakout didn't
-# already fire this cycle for that symbol, but its LOGIC now mirrors the
+# already fire this cycle for that symbol, and its LOGIC mirrors the
 # Google Sheet's "PDH Break" page instead of its old Donchian/RSI/VO%-based
-# conditions: it fires the instant today's High trades at or above the
-# previous trading day's High AND Volume Multiple exceeds
-# PDH_VOL_MULTIPLE_THRESHOLD — nothing else gates it (no RSI, no Donchian,
-# no Daily VO%, no Change % requirement), exactly like the Sheet's PDH
-# Break scan. See is_early_watchlist below. The "Early Watchlist" name is
-# unchanged everywhere (toggle, Telegram alerts, active-trade dedup,
-# dashboard tab).
+# conditions: it fires when today's High trades at or above the previous
+# trading day's High, Volume Multiple exceeds PDH_VOL_MULTIPLE_THRESHOLD,
+# AND Change % vs PrevClose is >= PRICE_MOVE_PCT_THRESHOLD (1%) — the one
+# condition it now shares with Happy Breakout. Nothing else gates it (no
+# RSI, no Donchian, no Daily VO%). See is_early_watchlist below. The
+# "Early Watchlist" name is unchanged everywhere (toggle, Telegram alerts,
+# active-trade dedup, dashboard tab).
 #
 # NOTE: SL conditions were intentionally removed entirely — exits are now
 # handled purely by the two-stage EMA exit engine below, not by price-based
@@ -841,14 +841,14 @@ with st.sidebar:
     )
     notify_early = st.toggle(
         f"Enable Early Watchlist {EARLY_WATCHLIST_EMOJI} (PDH Break: High \u2265 Prev Day High + "
-        f"Vol Multiple > {PDH_VOL_MULTIPLE_THRESHOLD}x)",
+        f"Vol Multiple > {PDH_VOL_MULTIPLE_THRESHOLD}x + Change \u2265{PRICE_MOVE_PCT_THRESHOLD}%)",
         value=True,
         help=(
-            f"Mirrors the Google Sheet's \u2018PDH Break\u2019 page: fires the instant today's High "
-            f"trades at or above the previous trading day's High, AND Volume Multiple (today's volume "
-            f"\u00f7 20-day Avg Volume incl. today's live volume) exceeds {PDH_VOL_MULTIPLE_THRESHOLD}x. "
-            f"Nothing else gates it \u2014 no RSI, no 15m Donchian breakout, no Daily Volume Oscillator, "
-            f"and no Change % requirement \u2014 so it can fire with essentially zero lag, independently "
+            f"Mirrors the Google Sheet's \u2018PDH Break\u2019 page: fires when today's High trades at "
+            f"or above the previous trading day's High, Volume Multiple (today's volume \u00f7 20-day "
+            f"Avg Volume incl. today's live volume) exceeds {PDH_VOL_MULTIPLE_THRESHOLD}x, AND Change % "
+            f"vs PrevClose is \u2265{PRICE_MOVE_PCT_THRESHOLD}%. No RSI, no 15m Donchian breakout, and no "
+            f"Daily Volume Oscillator requirement \u2014 those still don't gate this tier, independently "
             f"of Happy Breakout. Only checked if Happy Breakout didn't already fire this cycle for that "
             f"symbol. No SL is shown; exits are handled by the 9/21-EMA exit engine."
         )
@@ -1035,11 +1035,13 @@ if 'access_token' in st.session_state:
 
             # Volume Multiple is based on current daily volume vs 20-period daily average volume.
             # Computed BEFORE the lazy-evaluation gate below (avg_v_20 comes from the separately
-            # cached get_daily_avg_vol_20() call, not from the multi-timeframe candle fetch), so a
-            # symbol with a high Volume Multiple but Change % < 1% can still qualify for a full
-            # candle fetch — this is what lets the PDH-Break-mirrored Early Watchlist condition
-            # below evaluate independently of Change %, exactly like the Google Sheet's PDH Break
-            # scan (see PDH_VOL_MULTIPLE_THRESHOLD).
+            # cached get_daily_avg_vol_20() call, not from the multi-timeframe candle fetch).
+            # NOTE: is_vol_multiple_high still widens should_evaluate to fetch candles for a
+            # symbol below 1% Change % (left untouched, unchanged from before) — but since
+            # is_early_watchlist below now ALSO requires pct >= PRICE_MOVE_PCT_THRESHOLD, a
+            # sub-1% symbol pulled in only via is_vol_multiple_high can no longer actually
+            # qualify for Early Watchlist. It's harmless (just an extra candle fetch on some
+            # symbols) and left in place since nothing was asked to change here.
             vol_multiple = (vol / avg_v_20) if avg_v_20 > 0 and avg_v_20 < 999999999 else 0.0
             is_vol_multiple_high = vol_multiple > PDH_VOL_MULTIPLE_THRESHOLD
 
@@ -1114,20 +1116,22 @@ if 'access_token' in st.session_state:
             )
 
             # PDH BREAK MIRROR (replaces the old Donchian/RSI/VO%-based Early
-            # Watchlist condition): trigger the instant today's High trades at
-            # or above the previous trading day's High AND Volume Multiple
-            # (today's volume ÷ 20-day avg volume incl. today's live volume)
-            # exceeds PDH_VOL_MULTIPLE_THRESHOLD — exactly the Google Sheet's
-            # "PDH Break" page (runPdhBreakScan_ / PDH_VOL_MULTIPLE_THRESHOLD).
-            # Intentionally independent of RSI, Donchian, Daily VO%, and
-            # Change % — none of those gate this tier, same as the Sheet. The
-            # "Early Watchlist" name is kept unchanged everywhere below
-            # (toggle, Telegram, active-trade dedup, dashboard tab).
+            # Watchlist condition): trigger when today's High trades at or
+            # above the previous trading day's High, Volume Multiple (today's
+            # volume ÷ 20-day avg volume incl. today's live volume) exceeds
+            # PDH_VOL_MULTIPLE_THRESHOLD, AND Change % vs PrevClose is >=
+            # PRICE_MOVE_PCT_THRESHOLD — this last condition is the ADDED
+            # logic, shared with Happy Breakout's price-move requirement.
+            # RSI, Donchian, and Daily VO% still do NOT gate this tier, same
+            # as the Sheet's "PDH Break" page. The "Early Watchlist" name is
+            # kept unchanged everywhere below (toggle, Telegram, active-trade
+            # dedup, dashboard tab).
             is_early_watchlist = (
                 avg_v_20 > 0 and avg_v_20 < 999999999
                 and vol_multiple > PDH_VOL_MULTIPLE_THRESHOLD
                 and pdh_value > 0
                 and today_high >= pdh_value
+                and pct >= PRICE_MOVE_PCT_THRESHOLD
             )
 
             # Persistent, exit-gated dedup: a tier only fires once per
@@ -1271,9 +1275,10 @@ if 'access_token' in st.session_state:
         ].copy()
 
         # Early Watchlist tab — filtered on the exact same boolean used for
-        # the Telegram/PC Early Watchlist alerts (now the PDH-Break mirror:
-        # today's High \u2265 Previous Day High AND Volume Multiple >
-        # PDH_VOL_MULTIPLE_THRESHOLD). Independent of df_combo's (unchanged,
+        # the Telegram/PC Early Watchlist alerts (PDH-Break mirror + added
+        # Change % condition: today's High \u2265 Previous Day High AND
+        # Volume Multiple > PDH_VOL_MULTIPLE_THRESHOLD AND Change % \u2265
+        # PRICE_MOVE_PCT_THRESHOLD). Independent of df_combo's (unchanged,
         # legacy) Happy Breakout filter.
         df_early = df_display[df_display['_is_early_watchlist'] == True].copy()
 
