@@ -126,6 +126,27 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 # NOTE: SL conditions were intentionally removed entirely — exits are now
 # handled purely by the two-stage EMA exit engine below, not by price-based
 # stop levels.
+#
+# ----------------------------------------------------------------
+# V2 — AVG VOLUME UNIFIED + HAPPY BREAKOUT TAB UNIFIED WITH THE ALERT
+# ----------------------------------------------------------------
+# 1) Avg Volume is now sourced from ONE place everywhere in this app: the
+#    live 20-day daily average (last 20 daily candles, SMA basis, including
+#    today's still-forming volume) computed by get_daily_avg_vol_20(). This
+#    matches TradingView's own Volume indicator settings (MA Length 20,
+#    Volume MA: SMA) and is the same basis the dashboard's "Avg Volume" /
+#    "Vol Multiple" columns already displayed correctly. The old, separate
+#    22-completed-day average (get_daily_avg_vol(), ttl=86400) has been
+#    removed — Volume Breakout, Happy Breakout, and Early Watchlist all now
+#    read from the exact same avg_v_20 number, so they can never disagree.
+# 2) The "🚀 Happy Breakout" dashboard tab previously used its OWN, looser
+#    filter (Vol Multiple >=1.1x, RSI>65, VO>=100%) — independent of the
+#    stricter 8-condition Happy Breakout Telegram/PC alert (Vol Multiple
+#    >2.5x, Volume >500k, Change %>=1%, 15m Donchian breakout, RSI>70, RSI
+#    above its own EMA34, Daily VO%>=100%). That tab now filters on the
+#    EXACT SAME boolean used for the alert (is_happy_breakout), so the tab
+#    and the alert always show the same set of stocks.
+# ----------------------------------------------------------------
 
 # LEGACY (no longer used by is_early_watchlist — kept only for reference/
 # history; the Early Watchlist condition now uses PDH_VOL_MULTIPLE_THRESHOLD
@@ -570,37 +591,14 @@ def get_last_closed_candle_index(df, interval_minutes=15):
     # Last row is still forming — fall back to the previous (closed) row.
     return last_idx - 1 if last_idx - 1 >= 0 else None
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_daily_avg_vol(access_token, api_key, symbols):
-    kite_inst = KiteConnect(api_key=api_key)
-    kite_inst.set_access_token(access_token)
-    avg_vol_map = {}
-    to_date = datetime.now(IST).date()
-    from_date = to_date - timedelta(days=35)
-
-    def process_symbol(s, q):
-        try:
-            if q:
-                hist = kite_inst.historical_data(q['instrument_token'], from_date, to_date - timedelta(days=1), "day")
-                return s, sum([day['volume'] for day in hist[-22:]]) / 22 if len(hist) >= 22 else 999999999
-            return s, 999999999
-        except Exception:
-            return s, 999999999
-
-    for i in range(0, len(symbols), 100):
-        chunk = symbols[i:i+100]
-        try:
-            quotes = kite_inst.quote(chunk)
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                futures = [executor.submit(process_symbol, s, quotes.get(s)) for s in chunk]
-                for f in futures:
-                    sym, vol_val = f.result()
-                    avg_vol_map[sym] = vol_val
-        except Exception:
-            pass
-    return avg_vol_map
-
-# --- LIVE 20-PERIOD DAILY AVERAGE VOLUME (19 COMPLETED DAYS + TODAY LIVE) ---
+# ================================================================
+# V2: LIVE 20-PERIOD DAILY AVERAGE VOLUME — the ONLY average-volume source
+# used anywhere in this app (19 completed days + today's live volume).
+# This is a simple 20-period SMA of daily volume, matching TradingView's
+# own Volume indicator settings (MA Length: 20, Volume MA: SMA). Every
+# volume-based condition in this app — Vol Multiple, Volume Breakout,
+# Happy Breakout, Early Watchlist — reads from this single function.
+# ================================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_daily_avg_vol_20(access_token, api_key, symbols):
@@ -836,7 +834,9 @@ with st.sidebar:
             f"Avg Volume AND > {HAPPY_BREAKOUT_MIN_VOLUME:,} shares, 15m Donchian Upper Breakout, "
             f"15m RSI > {HAPPY_BREAKOUT_RSI_THRESHOLD} AND RSI > its own 34-EMA, Daily Volume Oscillator "
             f"(1,20) \u2265 +100%. Priority tier \u2014 checked before Early Watchlist each cycle. "
-            f"No SL is shown; exits are handled by the 9/21-EMA exit engine."
+            f"This SAME condition also drives the \U0001F680 Happy Breakout dashboard tab below — "
+            f"the tab and the alert can never disagree. No SL is shown; exits are handled by the "
+            f"9/21-EMA exit engine."
         )
     )
     notify_early = st.toggle(
@@ -993,7 +993,13 @@ if 'access_token' in st.session_state:
         st.warning("No symbols found across worksheets.")
         st.stop()
 
-    avg_vols = get_daily_avg_vol(st.session_state.access_token, API_KEY, symbols)
+    # V2: Avg Volume is now sourced EXCLUSIVELY from the live 20-day daily
+    # average (last 20 daily candles, SMA basis, including today's still-
+    # forming volume) — the same basis TradingView's Volume indicator uses
+    # (MA Length 20, Volume MA: SMA). The old, separate 22-completed-day
+    # average has been removed so every volume condition in this app (Vol
+    # Multiple, Volume Breakout, Happy Breakout, Early Watchlist) reads
+    # from this one single number.
     avg_vols_20 = get_daily_avg_vol_20(st.session_state.access_token, API_KEY, symbols)
     results = []
 
@@ -1027,11 +1033,14 @@ if 'access_token' in st.session_state:
             else:
                 pct = 0.0
 
-            avg_v = avg_vols.get(s, 0)
+            # V2: single Avg Volume source (live 20-day SMA incl. today).
             avg_v_20 = avg_vols_20.get(s, 0)
 
-            is_vol_break_500k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 500000)
-            is_vol_break_100k = (vol > (avg_v * 1.1) and pct >= 1.0 and vol >= 100000)
+            # V2: Volume Breakout conditions now read from the SAME 20-day
+            # live average used everywhere else in this app (avg_v_20),
+            # instead of the old, separate 22-completed-day average.
+            is_vol_break_500k = (vol > (avg_v_20 * 1.1) and pct >= 1.0 and vol >= 500000)
+            is_vol_break_100k = (vol > (avg_v_20 * 1.1) and pct >= 1.0 and vol >= 100000)
 
             # Volume Multiple is based on current daily volume vs 20-period daily average volume.
             # Computed BEFORE the lazy-evaluation gate below (avg_v_20 comes from the separately
@@ -1211,15 +1220,18 @@ if 'access_token' in st.session_state:
                 "Volume": format_volume_short(vol),
                 "Avg Volume": format_volume_short(avg_v_20),
                 "Vol Multiple": format_volume_multiple(vol_multiple),
-                # Hidden helper fields (dropped before display) used only to filter the
-                # Happy Breakout tab with the exact numeric thresholds. UNCHANGED —
-                # this tab's filter logic is independent of the alert conditions above.
+                # Hidden helper fields (dropped before display).
                 "_vol_multiple_raw": vol_multiple,
                 "_rsi_15m": rsi_15m_val,
                 # The actual current Early Watchlist alert condition for this row (same
-                # boolean used for Telegram/PC alerts — now the PDH-Break mirror), used
+                # boolean used for Telegram/PC alerts — the PDH-Break mirror), used
                 # only to power the Early Watchlist dashboard tab below.
-                "_is_early_watchlist": is_early_watchlist
+                "_is_early_watchlist": is_early_watchlist,
+                # V2: the actual current Happy Breakout alert condition for this row
+                # (the SAME boolean used for Telegram/PC alerts), used to power the
+                # Happy Breakout dashboard tab below — this tab and the alert can no
+                # longer disagree, since both read from this one boolean.
+                "_is_happy_breakout": is_happy_breakout
             })
         except Exception:
             continue
@@ -1261,30 +1273,26 @@ if 'access_token' in st.session_state:
         else:
             df_display['vol_numeric'] = 0.0
 
-        dc_condition = df_display['DC 15m'].astype(str).str.contains("🚀|True|UB", case=False, na=False) if 'DC 15m' in df_display.columns else False
-
-        # UNCHANGED: Happy Breakout tab keeps its original filter definition
-        # (1.1x vol / RSI>65 / VO>=100%), independent of the Telegram/PC
-        # alert thresholds above.
-        df_combo = df_display[
-            dc_condition
-            & (df_display['_vol_multiple_raw'] >= 1.1)
-            & (df_display['Change %'] >= 1.0)
-            & (df_display['_rsi_15m'] > 65)
-            & (df_display['Daily VO %'] >= 100.0)
-        ].copy()
+        # V2: Happy Breakout tab — filtered on the exact same boolean used
+        # for the Telegram/PC Happy Breakout alerts (Vol Multiple >2.5x +
+        # Volume >500k + Change % >=1% + 15m Donchian Upper Breakout + 15m
+        # RSI >70 + RSI above its own EMA34 + Daily VO% >=100%). This tab
+        # and the alert can no longer disagree, since both now read from
+        # this one boolean (was previously a separate, looser 1.1x/RSI>65
+        # filter, independent of the alert).
+        df_combo = df_display[df_display['_is_happy_breakout'] == True].copy()
 
         # Early Watchlist tab — filtered on the exact same boolean used for
         # the Telegram/PC Early Watchlist alerts (PDH-Break mirror + added
         # Change % condition: today's High \u2265 Previous Day High AND
         # Volume Multiple > PDH_VOL_MULTIPLE_THRESHOLD AND Change % \u2265
-        # PRICE_MOVE_PCT_THRESHOLD). Independent of df_combo's (unchanged,
-        # legacy) Happy Breakout filter.
+        # PRICE_MOVE_PCT_THRESHOLD). Independent of df_combo's Happy
+        # Breakout filter.
         df_early = df_display[df_display['_is_early_watchlist'] == True].copy()
 
         # Clean temporary/hidden helper columns before anything gets displayed
         for df_item in [df_display, df_combo, df_early]:
-            df_item.drop(columns=['vol_numeric', '_vol_multiple_raw', '_rsi_15m', '_is_early_watchlist'], inplace=True, errors='ignore')
+            df_item.drop(columns=['vol_numeric', '_vol_multiple_raw', '_rsi_15m', '_is_early_watchlist', '_is_happy_breakout'], inplace=True, errors='ignore')
 
         combo_count = len(df_combo)
         early_count = len(df_early)
