@@ -171,6 +171,10 @@ PDH_VOL_MULTIPLE_THRESHOLD = 1.5
 EARLY_WATCHLIST_EMOJI = "🚩"
 HAPPY_BREAKOUT_EMOJI = "🟢"
 
+# --- BOOK PROFIT (optional, toggle OFF by default) ---
+BOOK_PROFIT_RSI_THRESHOLD = 90.0   # 15m RSI >= this -> "BOOK PROFIT" alert
+BOOK_PROFIT_EMOJI = "💰"
+
 # --- PERSISTENT ACTIVE TRADES STORAGE UTILS ---
 # active_trades.json is the single source of truth for both (a) exit
 # monitoring and (b) alert dedup. Each entry carries "alerted_early" and
@@ -454,6 +458,34 @@ def trigger_alert(symbol, alert_type, ltp, score_emoji, chart_url=""):
     st.toast(f"{alert_type}: {symbol} ({score_emoji})", icon="🚀")
 
     send_telegram_alert(symbol, alert_type, ltp, score_emoji, chart_url=chart_url)
+
+# --- BOOK PROFIT NOTIFICATIONS (PC + Telegram) ---
+
+def send_telegram_book_profit(symbol, ltp, chart_url=""):
+    chart_link = f'<a href="{chart_url}">Open TV \u2197\ufe0f</a>' if chart_url else ""
+    message = (
+        f"<b>{BOOK_PROFIT_EMOJI} BOOK PROFIT: {symbol}</b>\n"
+        f"Exit: \u20b9{ltp}\n"
+        f"Chart: {chart_link}"
+    )
+    send_telegram_raw(message)
+
+def trigger_book_profit(symbol, ltp, chart_url=""):
+    notification_js = f"""
+    <script>
+    if (Notification.permission === "granted") {{
+        const n = new Notification("{BOOK_PROFIT_EMOJI} BOOK PROFIT: {symbol}", {{
+            body: "Exit: {ltp}",
+            icon: "https://kite.zerodha.com/static/images/kite-logo.svg"
+        }});
+        new Audio('https://media.geeksforgeeks.org/wp-content/uploads/20190531135120/beep.mp3').play();
+        setTimeout(() => n.close(), 5000);
+    }}
+    </script>
+    """
+    components.html(notification_js, height=0)
+    st.toast(f"BOOK PROFIT: {symbol} (₹{ltp})", icon="💰")
+    send_telegram_book_profit(symbol, ltp, chart_url=chart_url)
 
 # --- 3. SESSION STATE ---
 
@@ -809,6 +841,54 @@ def process_active_trade_exits(kite_inst, access_token, api_key, notify_exit1=Tr
     if updated:
         save_active_trades(active_trades)
 
+
+# ================================================================
+# BOOK PROFIT engine (optional, sidebar toggle — OFF by default)
+# ================================================================
+# For every symbol in Active Managed Trades, if the 15m RSI is >=
+# BOOK_PROFIT_RSI_THRESHOLD, send a one-time "BOOK PROFIT" PC + Telegram
+# alert. Fires once per trade lifecycle (flag stored in active_trades.json).
+# Does NOT remove the trade and does NOT touch Exit 1 / Final Exit logic.
+def process_book_profit_alerts(access_token, api_key, full_quotes):
+    active_trades = load_active_trades()
+    if not active_trades:
+        return
+
+    updated = False
+    for sym, data in list(active_trades.items()):
+        if data.get("book_profit_triggered", False):
+            continue
+
+        inst_token = data.get("instrument_token")
+        if not inst_token:
+            continue
+
+        df_15m = fetch_15m_candles(access_token, api_key, inst_token)
+        if df_15m is None or len(df_15m) < 15:
+            continue
+
+        rsi_val, _ = calculate_rsi_and_ema(df_15m['close'])
+        if rsi_val >= BOOK_PROFIT_RSI_THRESHOLD:
+            q = full_quotes.get(f"NSE:{sym}")
+            ltp = q['last_price'] if q else float(df_15m['close'].iloc[-1])
+            tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
+
+            trigger_book_profit(sym, ltp, chart_url=tv_url)
+            st.session_state.alerts_history.append({
+                "Symbol": sym,
+                "Type": "Book Profit",
+                "Score": BOOK_PROFIT_EMOJI,
+                "Time": datetime.now(IST).strftime("%H:%M:%S"),
+                "LTP": ltp,
+                "Chart": tv_url
+            })
+
+            data["book_profit_triggered"] = True
+            updated = True
+
+    if updated:
+        save_active_trades(active_trades)
+
 # --- 6. SIDEBAR ---
 
 with st.sidebar:
@@ -879,6 +959,15 @@ with st.sidebar:
             "unchanged — plain close below the 21-EMA on the last closed 15m candle, no ATR buffer. "
             "Turn this off to stop positions from being auto-closed — they simply stay listed under "
             "Active Managed Trades until you turn this back on or reset the log manually."
+        )
+    )
+    notify_book_profit = st.toggle(
+        f"Enable Book Profit Alerts {BOOK_PROFIT_EMOJI} (15m RSI ≥ {BOOK_PROFIT_RSI_THRESHOLD:.0f})",
+        value=False,
+        help=(
+            f"Sends a one-time 'BOOK PROFIT' PC + Telegram alert for any symbol in Active Managed "
+            f"Trades when its 15m RSI reaches {BOOK_PROFIT_RSI_THRESHOLD:.0f} or higher. Does not "
+            f"close the trade; Exit 1 / Final Exit keep working independently. OFF by default."
         )
     )
 
@@ -1176,6 +1265,7 @@ if 'access_token' in st.session_state:
                     "alerted_early": prior.get("alerted_early", False) or (alert_type == "Early Watchlist Alert"),
                     "alerted_happy": prior.get("alerted_happy", False) or (alert_type == "Happy Breakout"),
                     "exit1_triggered": prior.get("exit1_triggered", False),
+                    "book_profit_triggered": prior.get("book_profit_triggered", False),
                     "final_exit_triggered": False
                 }
                 save_active_trades(active_trades)
@@ -1242,6 +1332,11 @@ if 'access_token' in st.session_state:
             st.session_state.kite, st.session_state.access_token, API_KEY,
             notify_exit1=notify_exit1, notify_final_exit=notify_final_exit
         )
+        # NEW: optional Book Profit alerts (15m RSI >= 90) — toggle OFF by default
+        if notify_book_profit:
+            process_book_profit_alerts(
+                st.session_state.access_token, API_KEY, full_quotes
+            )
 
     # --- 8. DASHBOARD DISPLAY ---
 
