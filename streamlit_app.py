@@ -146,6 +146,12 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 #    above its own EMA34, Daily VO%>=100%). That tab now filters on the
 #    EXACT SAME boolean used for the alert (is_happy_breakout), so the tab
 #    and the alert always show the same set of stocks.
+#
+# V3 — BB MEDIAN REMOVED, RSI COLUMNS ADDED
+# The BB Median (20 SMA shifted +6) logic has been removed from this script
+# entirely (calculate_bb_median, get_bb_status and the four "BB Med" table
+# columns). The dashboard now shows RSI(14) for 15m / 1H / Day / Week
+# instead ("RSI 15m", "RSI 1H", "RSI Day", "RSI Wk").
 # ----------------------------------------------------------------
 
 # LEGACY (no longer used by is_early_watchlist — kept only for reference/
@@ -167,6 +173,8 @@ PRICE_MOVE_PCT_THRESHOLD = 1.0  # vs PrevClose, matches existing "pct" field; us
 # Multiple (today's volume ÷ 20-day avg volume incl. today's live volume)
 # must exceed this for the PDH-break condition to be able to fire.
 PDH_VOL_MULTIPLE_THRESHOLD = 1.5
+# HAPPY SF: Donchian 15m Upper Breakout + Volume Multiple threshold
+HAPPY_SF_VOL_MULTIPLE = 1.1
 
 EARLY_WATCHLIST_EMOJI = "🚩"
 HAPPY_BREAKOUT_EMOJI = "🟢"
@@ -204,22 +212,6 @@ def save_active_trades(trades):
     except Exception:
         pass
 
-# --- TECHNICAL HELPERS: BB MEDIAN WITH OFFSET ---
-
-def calculate_bb_median(df, length=20, offset=6):
-    """
-    Calculates 20 SMA shifted forward by 6 bars.
-    Works universally across 15m, 1h, Daily, and Weekly DataFrames.
-    """
-    if df is None or len(df) < (length + offset):
-        return 0.0
-
-    sma_20 = df['close'].rolling(window=length).mean()
-    bb_median_shifted = sma_20.shift(offset)
-
-    latest_val = bb_median_shifted.iloc[-1]
-    return round(float(latest_val), 2) if pd.notna(latest_val) else 0.0
-
 # --- TECHNICAL HELPERS: RSI, EMA & VOLUME OSCILLATOR ---
 
 def calculate_rsi_and_ema(series, period=14, ema_period=34):
@@ -245,6 +237,18 @@ def calculate_rsi_and_ema(series, period=14, ema_period=34):
 
     rsi_ema_series = rsi_series.ewm(span=ema_period, adjust=False).mean()
     return float(rsi_series.iloc[-1]), float(rsi_ema_series.iloc[-1])
+
+# Latest RSI(14) for the dashboard's "RSI 15m / 1H / Day / Wk" columns.
+# Returns NaN (shown as "N/A" in the rich table, blank in the native table)
+# when the timeframe's DataFrame is missing or too short to compute RSI.
+def get_latest_rsi(df, period=14):
+    if df is None or df.empty or 'close' not in df.columns or len(df) < period + 1:
+        return float('nan')
+    try:
+        rsi_val, _ = calculate_rsi_and_ema(df['close'], period=period)
+        return round(float(rsi_val), 2)
+    except Exception:
+        return float('nan')
 
 # --- TRADINGVIEW VOLUME OSCILLATOR (Shortlen = 1, Longlen = 20) ---
 
@@ -504,7 +508,7 @@ if 'access_token' not in st.session_state and os.path.exists(TOKEN_FILE):
     except Exception:
         pass
 
-# --- 4. DONCHIAN CHANNEL, BB MEDIAN STATUS & CACHED HISTORICAL DATA ---
+# --- 4. DONCHIAN CHANNEL & CACHED HISTORICAL DATA ---
 
 def get_donchian_status(df, length=28, offset=6):
     if df is None or len(df) < (length + offset):
@@ -545,44 +549,6 @@ def get_previous_day_high(df_day, today_key):
         return float(completed['high'].iloc[-1])
     except Exception:
         return 0.0
-
-def get_bb_status(df, ltp, length=20, offset=6):
-    """
-    Calculates BB Median status:
-    - 'Cross Above 🚀' : Recently crossed above BB Median
-    - 'Support 🛡️'    : LTP within 0.5% of BB Median while above it
-    - 'Above 🟢'       : LTP > BB Median
-    - 'Below 🔴'       : LTP < BB Median
-    """
-    if df is None or df.empty or len(df) < (length + offset):
-        return "Below 🔴", False, False
-
-    df_calc = df.iloc[-(length + offset):].copy()
-    sma20 = df_calc['close'].rolling(window=length).mean()
-
-    current_bb_med = sma20.iloc[-1]
-    prev_bb_med = sma20.iloc[-2] if len(sma20) >= 2 else current_bb_med
-    prev_close = df_calc['close'].iloc[-2] if len(df_calc) >= 2 else ltp
-
-    if pd.isna(current_bb_med) or current_bb_med == 0:
-        return "Below 🔴", False, False
-
-    is_above = ltp > current_bb_med
-    is_cross_above = (prev_close <= prev_bb_med) and (ltp > current_bb_med)
-
-    dist_pct = ((ltp - current_bb_med) / current_bb_med) * 100.0
-    is_support = (0.0 <= dist_pct <= 0.5)
-
-    if is_cross_above:
-        status_str = "Cross Above 🚀"
-    elif is_support:
-        status_str = "Support 🛡️"
-    elif is_above:
-        status_str = "Above 🟢"
-    else:
-        status_str = "Below 🔴"
-
-    return status_str, is_cross_above, is_support
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_15m_candles(access_token, api_key, instrument_token):
@@ -934,7 +900,7 @@ with st.sidebar:
         )
     )
     notify_vol = st.toggle("Enable Individual Volume Alerts", value=False)
-    notify_dc = st.toggle("Enable Individual Donchian Alerts", value=False)
+    notify_dc = st.toggle("Enable Individual Donchian Alerts", value=True)
 
     st.divider()
     st.header("🚪 Exit Alert Controls")
@@ -1144,7 +1110,8 @@ if 'access_token' in st.session_state:
             is_vol_multiple_high = vol_multiple > PDH_VOL_MULTIPLE_THRESHOLD
 
             # LAZY EVALUATION
-            should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k or is_vol_multiple_high
+            is_happy_sf_vol_ok = notify_dc and vol_multiple >= HAPPY_SF_VOL_MULTIPLE
+            should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k or is_vol_multiple_high or is_happy_sf_vol_ok
 
             rsi_15m_val = 0.0
             rsi_15m_ema34 = 0.0  # used only by the Happy Breakout alert condition below
@@ -1173,11 +1140,13 @@ if 'access_token' in st.session_state:
                 dc_status, is_dc_breakout = get_donchian_status(df_15m, length=28, offset=6)
                 dc_short_status = dc_status.replace("🚀 UPPER BREAKOUT", "🚀 UB")
 
-                # BB Median Status across all timeframes
-                bb_15m_status, _, _ = get_bb_status(df_15m, ltp)
-                bb_1h_status,  _, _ = get_bb_status(df_1h, ltp)
-                bb_day_status, _, _ = get_bb_status(df_day, ltp)
-                bb_wk_status,  _, _ = get_bb_status(df_week, ltp)
+                # Display-only RSI(14) for the dashboard's RSI columns
+                # (replaces the old BB Median columns). Independent of the
+                # Score / alert logic above — never feeds any alert condition.
+                disp_rsi_15m = get_latest_rsi(df_15m)
+                disp_rsi_1h = get_latest_rsi(df_1h)
+                disp_rsi_day = get_latest_rsi(df_day)
+                disp_rsi_wk = get_latest_rsi(df_week)
 
                 # Previous Day High — mirrors the Google Sheet's PDH Break scan
                 # (fetchPreviousDayHigh_ / getCachedPreviousDayHigh_): the High of
@@ -1190,8 +1159,10 @@ if 'access_token' in st.session_state:
                 star_score_plain, star_score_html = "0/5", '<div class="score-tooltip">0/5<div class="tooltip-text"><b>5-Star Checklist Breakdown</b><br><hr style="margin:4px 0;">Not Evaluated</div></div>'
                 df_15m = None
                 dc_short_status, is_dc_breakout = "Below", False
-                bb_15m_status, bb_1h_status = "Below 🔴", "Below 🔴"
-                bb_day_status, bb_wk_status = "Below 🔴", "Below 🔴"
+                disp_rsi_15m = float('nan')
+                disp_rsi_1h = float('nan')
+                disp_rsi_day = float('nan')
+                disp_rsi_wk = float('nan')
                 pdh_value = 0.0  # not known yet — this symbol is simply judged again on the next refresh
 
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
@@ -1250,8 +1221,10 @@ if 'access_token' in st.session_state:
                     alert_type = "Early Watchlist Alert"
                 elif notify_vol and is_vol_break_500k and f"{sym_short}|Volume Breakout" not in alerted_keys:
                     alert_type = "Volume Breakout"
-                elif notify_dc and is_dc_breakout and f"{sym_short}|Donchian Upper 15m" not in alerted_keys:
-                    alert_type = "Donchian Upper 15m"
+                elif (notify_dc and is_dc_breakout
+                     and vol_multiple >= HAPPY_SF_VOL_MULTIPLE
+                     and f"{sym_short}|HAPPY SF" not in alerted_keys):
+                     alert_type = "HAPPY SF"
 
             if alert_type in ("Happy Breakout", "Early Watchlist Alert"):
                 score_emoji = HAPPY_BREAKOUT_EMOJI if alert_type == "Happy Breakout" else EARLY_WATCHLIST_EMOJI
@@ -1300,10 +1273,10 @@ if 'access_token' in st.session_state:
                 "Score": star_score_html,
                 "LTP": ltp,
                 "Change %": pct,
-                "BB Med 15m": bb_15m_status,
-                "BB Med 1H": bb_1h_status,
-                "BB Med Day": bb_day_status,
-                "BB Med Wk": bb_wk_status,
+                "RSI 15m": disp_rsi_15m,
+                "RSI 1H": disp_rsi_1h,
+                "RSI Day": disp_rsi_day,
+                "RSI Wk": disp_rsi_wk,
                 "Daily VO %": vol_osc_pct,
                 "DC 15m": dc_short_status,
                 "Chart": tv_url,
@@ -1421,10 +1394,10 @@ if 'access_token' in st.session_state:
             "Score": st.column_config.TextColumn("Score"),
             "LTP": st.column_config.NumberColumn("LTP", format="₹%.2f"),
             "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
-            "BB Med 15m": st.column_config.NumberColumn("BB Med 15m", format="₹%.2f"),
-            "BB Med 1H": st.column_config.NumberColumn("BB Med 1H", format="₹%.2f"),
-            "BB Med Day": st.column_config.TextColumn("BB Med Day"),
-            "BB Med Wk": st.column_config.TextColumn("BB Med Wk"),
+            "RSI 15m": st.column_config.NumberColumn("RSI 15m", format="%.2f"),
+            "RSI 1H": st.column_config.NumberColumn("RSI 1H", format="%.2f"),
+            "RSI Day": st.column_config.NumberColumn("RSI Day", format="%.2f"),
+            "RSI Wk": st.column_config.NumberColumn("RSI Wk", format="%.2f"),
             "Daily VO %": st.column_config.NumberColumn("Daily VO %", format="%.2f%%"),
             "Volume": st.column_config.TextColumn("Volume"),
             "Avg Volume": st.column_config.TextColumn("Avg Volume"),
@@ -1446,6 +1419,13 @@ if 'access_token' in st.session_state:
                 df_calc['Daily VO %'] = df_calc['Daily VO %'].apply(
                     lambda x: f"+{x:.2f}% 🟢" if isinstance(x, (int, float)) and x >= 100.0 else (f"{x:.2f}%" if isinstance(x, (int, float)) else str(x))
                 )
+
+            # RSI columns: 2-decimal value, or "N/A" when not evaluated / not enough candles.
+            for rsi_col in ['RSI 15m', 'RSI 1H', 'RSI Day', 'RSI Wk']:
+                if rsi_col in df_calc.columns:
+                    df_calc[rsi_col] = df_calc[rsi_col].apply(
+                        lambda x: f"{x:.2f}" if isinstance(x, (int, float)) and pd.notna(x) else "N/A"
+                    )
 
             html_code = df_calc.to_html(escape=False, index=False, classes="custom-table")
             st.markdown(html_code, unsafe_allow_html=True)
