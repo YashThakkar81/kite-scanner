@@ -152,6 +152,17 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 # entirely (calculate_bb_median, get_bb_status and the four "BB Med" table
 # columns). The dashboard now shows RSI(14) for 15m / 1H / Day / Week
 # instead ("RSI 15m", "RSI 1H", "RSI Day", "RSI Wk").
+#
+# V4 — GAP-UP OPENING RANGE FILTER (sidebar toggle, ON by default)
+# Stocks that OPEN >= GAP_UP_PCT_THRESHOLD (1.5%) above the previous day's
+# close are held back from ALL alert tiers until they trade above the
+# opening-range high (high of the 9:15 and 9:30 candles = first 30 minutes,
+# complete at 9:45). Before 9:45 a gap-up stock never alerts; from 9:45 on it
+# alerts only while LTP is above that opening-range high, and then the normal
+# trigger conditions decide as usual. Non-gap stocks are NOT affected and can
+# alert at any time (9:25, 9:30, ...). Alert dedup flags are only written when
+# an alert actually fires, so a blocked stock can still alert later. Nothing
+# on the dashboard changes — the gate sits only in front of the alert chain.
 # ----------------------------------------------------------------
 
 # LEGACY (no longer used by is_early_watchlist — kept only for reference/
@@ -175,6 +186,11 @@ PRICE_MOVE_PCT_THRESHOLD = 1.0  # vs PrevClose, matches existing "pct" field; us
 PDH_VOL_MULTIPLE_THRESHOLD = 1.5
 # HAPPY SF: Donchian 15m Upper Breakout + Volume Multiple threshold
 HAPPY_SF_VOL_MULTIPLE = 1.1
+
+# GAP-UP OPENING RANGE FILTER
+GAP_UP_PCT_THRESHOLD = 1.5            # open vs previous close, in %
+OPENING_RANGE_START = dtime(9, 15)    # first 15m candle of the session
+OPENING_RANGE_END = dtime(9, 45)      # range = candles starting 9:15 and 9:30
 
 EARLY_WATCHLIST_EMOJI = "🚩"
 HAPPY_BREAKOUT_EMOJI = "🟢"
@@ -550,6 +566,39 @@ def get_previous_day_high(df_day, today_key):
     except Exception:
         return 0.0
 
+# ================================================================
+# OPENING RANGE HIGH (9:15-9:45) — for the Gap-Up Opening Range Filter.
+# ================================================================
+# High of today's 15m candles that START between 9:15 and 9:45 (i.e. the
+# 9:15 and 9:30 candles). Returns 0.0 ("unknown") unless today's data already
+# contains a candle starting at/after 9:45 — that proves the 9:30 candle is
+# complete, so a cached (up to 5 min old) DataFrame fetched mid-way through
+# the 9:30 candle can't produce an understated range high. Unknown = the gap
+# stock simply stays blocked until fresh data arrives.
+def get_opening_range_high(df_15m, today_key):
+    if df_15m is None or df_15m.empty or 'date' not in df_15m.columns:
+        return 0.0
+    try:
+        range_highs = []
+        range_closed = False
+        for d, h in zip(df_15m['date'], df_15m['high']):
+            if isinstance(d, str):
+                d = pd.to_datetime(d)
+            if d.tzinfo is not None:
+                d = d.astimezone(IST)
+            if d.strftime('%Y-%m-%d') != today_key:
+                continue
+            t = d.time()
+            if OPENING_RANGE_START <= t < OPENING_RANGE_END:
+                range_highs.append(float(h))
+            elif t >= OPENING_RANGE_END:
+                range_closed = True
+        if range_highs and range_closed:
+            return max(range_highs)
+        return 0.0
+    except Exception:
+        return 0.0
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_15m_candles(access_token, api_key, instrument_token):
     try:
@@ -901,6 +950,18 @@ with st.sidebar:
     )
     notify_vol = st.toggle("Enable Individual Volume Alerts", value=False)
     notify_dc = st.toggle("Enable Individual Donchian Alerts", value=True)
+    notify_gap_filter = st.toggle(
+        f"Enable Gap-Up Filter 🛡️ (Open ≥ {GAP_UP_PCT_THRESHOLD}% above Prev Close → wait for 9:45 High break)",
+        value=True,
+        help=(
+            f"Stocks that open {GAP_UP_PCT_THRESHOLD}% or more above the previous day's close are held back "
+            f"from ALL alert types until they trade above the opening-range high (high of the 9:15 and "
+            f"9:30 candles, known at 9:45). Before 9:45 they never alert; after 9:45 they alert only while "
+            f"LTP is above that high, and then the normal trigger conditions apply. Stocks that did not "
+            f"gap up are unaffected and can alert at any time. Turn this off to restore the previous "
+            f"behaviour. Dashboard tables are not affected."
+        )
+    )
 
     st.divider()
     st.header("🚪 Exit Alert Controls")
@@ -1213,8 +1274,20 @@ if 'access_token' in st.session_state:
             # Old, unrelated toggles — unchanged, still session-only dedup.
             alerted_keys = [f"{a['Symbol']}|{a['Type']}" for a in st.session_state.alerts_history]
 
+            # GAP-UP OPENING RANGE FILTER — gate in front of the alert chain only.
+            # Open price falls back to LTP when Kite reports open = 0 (pre-open).
+            open_price = q['ohlc'].get('open', 0) or ltp
+            gap_pct = ((open_price - cl) / cl) * 100.0 if cl > 0 and open_price > 0 else 0.0
+            gap_blocked = False
+            if notify_gap_filter and gap_pct >= GAP_UP_PCT_THRESHOLD:
+                if datetime.now(IST).time() < OPENING_RANGE_END:
+                    gap_blocked = True  # before 9:45: gap-up stocks never alert
+                else:
+                    or_high = get_opening_range_high(df_15m, now_ist.strftime("%Y-%m-%d"))
+                    gap_blocked = not (or_high > 0 and ltp > or_high)
+
             alert_type = ""
-            if market_active:
+            if market_active and not gap_blocked:
                 if notify_combo and is_happy_breakout and not already_alerted_happy:
                     alert_type = "Happy Breakout"
                 elif notify_early and is_early_watchlist and not already_alerted_early:
