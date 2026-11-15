@@ -12,6 +12,14 @@ from datetime import datetime, timedelta, time as dtime
 from concurrent.futures import ThreadPoolExecutor
 from streamlit_autorefresh import st_autorefresh
 
+# --- LIVE CHART (TradingView lightweight-charts) ---
+# pip install streamlit-lightweight-charts
+try:
+    from streamlit_lightweight_charts import renderLightweightCharts
+    LWC_AVAILABLE = True
+except Exception:
+    LWC_AVAILABLE = False
+
 # --- 1. CONFIGURATION & BLUE TOGGLE + TOOLTIP STYLING ---
 
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
@@ -904,6 +912,144 @@ def process_book_profit_alerts(access_token, api_key, full_quotes):
     if updated:
         save_active_trades(active_trades)
 
+# ================================================================
+# LIVE INTERACTIVE CHART — "View Live Chart"
+# ================================================================
+# Embeds TradingView's open-source lightweight-charts directly in the
+# dashboard, fed by Kite Connect's historical_data(), which includes the
+# currently-forming candle. This bypasses TradingView's free feed, which
+# is 15-minute delayed for NSE. Intentionally NOT cached so every call
+# returns the live candle. Candlesticks + volume + EMA9 / EMA21.
+LIVE_CHART_TIMEFRAMES = {
+    "1m": ("minute", 5),
+    "5m": ("5minute", 15),
+    "15m": ("15minute", 30),
+    "1H": ("60minute", 90),
+    "Day": ("day", 500),
+}
+LIVE_CHART_UP = "#26a69a"
+LIVE_CHART_DOWN = "#ef5350"
+IST_OFFSET_SECONDS = 19800  # lightweight-charts draws UTC; shift so the axis shows IST
+
+
+def fetch_live_chart_candles(kite_inst, instrument_token, interval, days):
+    now = datetime.now(IST)
+    try:
+        hist = kite_inst.historical_data(instrument_token, now - timedelta(days=days), now, interval)
+    except Exception as e:
+        st.error(f"Chart data error: {e}")
+        return None
+    return pd.DataFrame(hist) if hist else None
+
+
+def _live_chart_time(d, daily):
+    if isinstance(d, str):
+        d = pd.to_datetime(d)
+    if daily:
+        return d.strftime("%Y-%m-%d")
+    if d.tzinfo is None:
+        d = IST.localize(d)
+    return int(d.timestamp()) + IST_OFFSET_SECONDS
+
+
+def _live_chart_series(df, daily):
+    df = df.copy()
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    candles, volumes, ema9, ema21 = [], [], [], []
+    for row in df.itertuples(index=False):
+        t = _live_chart_time(row.date, daily)
+        candles.append({"time": t, "open": float(row.open), "high": float(row.high),
+                        "low": float(row.low), "close": float(row.close)})
+        volumes.append({"time": t, "value": float(row.volume),
+                        "color": LIVE_CHART_UP if row.close >= row.open else LIVE_CHART_DOWN})
+        ema9.append({"time": t, "value": float(row.ema9)})
+        ema21.append({"time": t, "value": float(row.ema21)})
+    return candles, volumes, ema9, ema21
+
+
+def draw_live_chart(kite_inst, symbol, instrument_token, tf_label, height):
+    if not LWC_AVAILABLE:
+        st.error("`streamlit-lightweight-charts` is not installed. "
+                 "Run: pip install streamlit-lightweight-charts")
+        return
+
+    interval, days = LIVE_CHART_TIMEFRAMES[tf_label]
+    df = fetch_live_chart_candles(kite_inst, instrument_token, interval, days)
+    if df is None or df.empty:
+        st.info("No candle data available for this symbol / timeframe.")
+        return
+
+    daily = interval == "day"
+    candles, volumes, ema9, ema21 = _live_chart_series(df, daily)
+
+    chart_options = {
+        "height": height,
+        "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#D1D4DC"},
+        "grid": {"vertLines": {"color": "#1E222D"}, "horzLines": {"color": "#1E222D"}},
+        "crosshair": {"mode": 0},
+        "rightPriceScale": {"borderColor": "#2B2B43"},
+        "timeScale": {"borderColor": "#2B2B43", "timeVisible": not daily, "secondsVisible": False},
+    }
+
+    series = [
+        {"type": "Candlestick", "data": candles,
+         "options": {"upColor": LIVE_CHART_UP, "downColor": LIVE_CHART_DOWN, "borderVisible": False,
+                     "wickUpColor": LIVE_CHART_UP, "wickDownColor": LIVE_CHART_DOWN}},
+        {"type": "Line", "data": ema9,
+         "options": {"color": "#FFB300", "lineWidth": 1, "title": "EMA9"}},
+        {"type": "Line", "data": ema21,
+         "options": {"color": "#42A5F5", "lineWidth": 1, "title": "EMA21"}},
+        {"type": "Histogram", "data": volumes,
+         "options": {"priceFormat": {"type": "volume"}, "priceScaleId": "",
+                     "priceLineVisible": False, "lastValueVisible": False},
+         "priceScaleOptions": {"scaleMargins": {"top": 0.8, "bottom": 0}}},
+    ]
+
+    last = df.iloc[-1]
+    chg = (last["close"] - df.iloc[-2]["close"]) if len(df) > 1 else 0.0
+    st.caption(
+        f"**{symbol}** · {tf_label} · Last ₹{last['close']:.2f} ({chg:+.2f}) · "
+        f"Updated {datetime.now(IST).strftime('%H:%M:%S')} IST · source: Kite (live)"
+    )
+    renderLightweightCharts(
+        [{"chart": chart_options, "series": series}],
+        key=f"lwc_{symbol}_{tf_label}",
+    )
+
+
+def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active):
+    st.divider()
+    st.header("📈 View Live Chart")
+
+    if not symbol_options:
+        st.info("No symbols available to chart yet.")
+        return
+
+    lc1, lc2, lc3, lc4 = st.columns([3, 2, 2, 2])
+    symbol = lc1.selectbox("Symbol", symbol_options, key="livechart_sym")
+    tf_label = lc2.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True,
+                         key="livechart_tf")
+    height = lc3.slider("Height", 350, 900, 550, 50, key="livechart_h")
+    live = lc4.toggle("Live (5s)", value=market_is_active, key="livechart_live",
+                      help="Re-pulls the forming candle from Kite every 5 seconds. "
+                           "Only the chart reruns, not the whole scanner.")
+
+    token = token_lookup.get(symbol)
+    if not token:
+        st.warning("Instrument token not found for this symbol.")
+        return
+
+    if live and hasattr(st, "fragment"):
+        @st.fragment(run_every=5)
+        def _live_fragment():
+            draw_live_chart(kite_inst, symbol, token, tf_label, height)
+        _live_fragment()
+    else:
+        draw_live_chart(kite_inst, symbol, token, tf_label, height)
+
+
 # --- 6. SIDEBAR ---
 
 with st.sidebar:
@@ -1624,6 +1770,16 @@ if 'access_token' in st.session_state:
                 st.rerun()
         else:
             st.info("No active managed trades currently tracked.")
+
+        # --- LIVE INTERACTIVE CHART (TradingView lightweight-charts, Kite live data) ---
+        chart_symbols = list(dict.fromkeys(df_full["Symbol"].tolist()))
+        token_lookup = {
+            _s.replace("NSE:", ""): _q["instrument_token"]
+            for _s, _q in full_quotes.items() if "instrument_token" in _q
+        }
+        render_live_chart_section(
+            st.session_state.kite, chart_symbols, token_lookup, market_active
+        )
 
 else:
     st.info("Click 'Activate Session' or adjust sidebar filters to display market data.")
