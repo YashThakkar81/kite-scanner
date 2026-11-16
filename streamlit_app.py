@@ -13,7 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 from streamlit_autorefresh import st_autorefresh
 
 # --- LIVE CHART (TradingView lightweight-charts) ---
-# pip install streamlit-lightweight-charts
+# V5: the live chart now loads TradingView's lightweight-charts library straight from a CDN
+# inside the page, so `streamlit-lightweight-charts` is NO LONGER NEEDED. This old import is
+# kept (harmless) and is simply unused.
 try:
     from streamlit_lightweight_charts import renderLightweightCharts
     LWC_AVAILABLE = True
@@ -171,6 +173,15 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 # alert at any time (9:25, 9:30, ...). Alert dedup flags are only written when
 # an alert actually fires, so a blocked stock can still alert later. Nothing
 # on the dashboard changes — the gate sits only in front of the alert chain.
+#
+# V5 — "VIEW LIVE CHART" REPLACED WITH THE SAME CHART AS THE GOOGLE SHEET V51.5
+# The old streamlit-lightweight-charts chart (candles + volume + EMA9/21 only)
+# is replaced by a full in-page TradingView lightweight-charts build with the
+# 13 indicator modules of the Pine script "Happy Trading 1.2" + a lower
+# RSI / Volume Oscillator pane, settings panel (show/hide, colour, opacity,
+# thickness, style), 💾 Save, Light/Dark, Full-screen, timeframes
+# 3m 5m 15m 1H 4H D W M, scanner-list symbol picker (+ any typed NSE symbol),
+# and a Volume / Avg Vol / Vol M stats row. Nothing else in the scanner changed.
 # ----------------------------------------------------------------
 
 # LEGACY (no longer used by is_early_watchlist — kept only for reference/
@@ -913,33 +924,22 @@ def process_book_profit_alerts(access_token, api_key, full_quotes):
         save_active_trades(active_trades)
 
 # ================================================================
-# LIVE INTERACTIVE CHART — "View Live Chart"
+# LIVE INTERACTIVE CHART — "View Live Chart"  (V5 — same chart as the Google Sheet V51.5)
 # ================================================================
-# Embeds TradingView's open-source lightweight-charts directly in the
-# dashboard, fed by Kite Connect's historical_data(), which includes the
-# currently-forming candle. This bypasses TradingView's free feed, which
-# is 15-minute delayed for NSE. Intentionally NOT cached so every call
-# returns the live candle. Candlesticks + volume + EMA9 / EMA21.
+
 LIVE_CHART_TIMEFRAMES = {
-    "1m": ("minute", 5),
-    "5m": ("5minute", 15),
-    "15m": ("15minute", 30),
-    "1H": ("60minute", 90),
-    "Day": ("day", 500),
+    "3m": ("3minute", 20),
+    "5m": ("5minute", 30),
+    "15m": ("15minute", 60),
+    "1H": ("60minute", 150),
+    "4H": ("60minute", 300),   # built from 60-minute candles
+    "D": ("day", 800),
+    "W": ("day", 1500),        # built from daily candles
+    "M": ("day", 1900),        # built from daily candles
 }
-LIVE_CHART_UP = "#26a69a"
-LIVE_CHART_DOWN = "#ef5350"
-IST_OFFSET_SECONDS = 19800  # lightweight-charts draws UTC; shift so the axis shows IST
-
-
-def fetch_live_chart_candles(kite_inst, instrument_token, interval, days):
-    now = datetime.now(IST)
-    try:
-        hist = kite_inst.historical_data(instrument_token, now - timedelta(days=days), now, interval)
-    except Exception as e:
-        st.error(f"Chart data error: {e}")
-        return None
-    return pd.DataFrame(hist) if hist else None
+LIVE_CHART_HTF_DAYS = 800          # daily history used for previous day / week / month levels
+LIVE_CHART_REFRESH_OPTIONS = [0, 10, 15, 30, 60]   # seconds, 0 = off
+IST_OFFSET_SECONDS = 19800         # lightweight-charts draws UTC; shift so the axis shows IST
 
 
 def _live_chart_time(d, daily):
@@ -952,102 +952,1505 @@ def _live_chart_time(d, daily):
     return int(d.timestamp()) + IST_OFFSET_SECONDS
 
 
-def _live_chart_series(df, daily):
-    df = df.copy()
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-
-    candles, volumes, ema9, ema21 = [], [], [], []
-    for row in df.itertuples(index=False):
-        t = _live_chart_time(row.date, daily)
-        candles.append({"time": t, "open": float(row.open), "high": float(row.high),
-                        "low": float(row.low), "close": float(row.close)})
-        volumes.append({"time": t, "value": float(row.volume),
-                        "color": LIVE_CHART_UP if row.close >= row.open else LIVE_CHART_DOWN})
-        ema9.append({"time": t, "value": float(row.ema9)})
-        ema21.append({"time": t, "value": float(row.ema21)})
-    return candles, volumes, ema9, ema21
+def _live_chart_rows(hist, daily):
+    rows = []
+    for r in hist:
+        rows.append([
+            _live_chart_time(r["date"], daily),
+            float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]),
+            float(r.get("volume", 0) or 0),
+        ])
+    return rows
 
 
-def draw_live_chart(kite_inst, symbol, instrument_token, tf_label, height):
-    if not LWC_AVAILABLE:
-        st.error("`streamlit-lightweight-charts` is not installed. "
-                 "Run: pip install streamlit-lightweight-charts")
-        return
+def fetch_live_chart_candles(kite_inst, instrument_token, interval, days):
+    # Intentionally NOT cached so every call returns the live, still-forming candle.
+    now = datetime.now(IST)
+    try:
+        hist = kite_inst.historical_data(instrument_token, now - timedelta(days=days), now, interval)
+    except Exception as e:
+        st.error(f"Chart data error: {e}")
+        return None
+    return hist if hist else None
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_live_chart_htf(access_token, api_key, instrument_token):
+    """Daily candles used for previous day / week / month levels (PDH, PWH, pivots ...)."""
+    try:
+        k = KiteConnect(api_key=api_key)
+        k.set_access_token(access_token)
+        now = datetime.now(IST)
+        hist = k.historical_data(instrument_token, now - timedelta(days=LIVE_CHART_HTF_DAYS), now, "day")
+        return _live_chart_rows(hist, True) if hist else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_live_chart_symbol_info(access_token, api_key, symbol):
+    """Instrument token + previous close for a symbol typed by hand (not in the scanner)."""
+    try:
+        k = KiteConnect(api_key=api_key)
+        k.set_access_token(access_token)
+        q = k.quote([f"NSE:{symbol}"]).get(f"NSE:{symbol}")
+        if q and q.get("instrument_token"):
+            return {"token": q["instrument_token"], "prevClose": float((q.get("ohlc") or {}).get("close", 0) or 0)}
+    except Exception:
+        pass
+    return None
+
+
+# NOTE: this is a raw string; the page must never contain three double quotes in a row.
+LIVE_CHART_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --bg:#131722; --bar:#1e222d; --txt:#d1d4dc; --mut:#9598a1; --bd:#2b2b43; --inp:#2a2e39; --inpbd:#434651; --pnl:#1a1e2b; --sum:#20242f; --foot:#787b86; }
+  body.light { --bg:#ffffff; --bar:#f0f3fa; --txt:#131722; --mut:#5d606b; --bd:#d0d3de; --inp:#ffffff; --inpbd:#b2b5be; --pnl:#f8f9fd; --sum:#eceff6; --foot:#5d606b; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--txt); font: 13px Arial, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 10px; background: var(--bar); border-bottom: 1px solid var(--bd); }
+  select, input, button { background: var(--inp); color: var(--txt); border: 1px solid var(--inpbd); border-radius: 4px; padding: 3px 7px; font-size: 12px; }
+  input.hex { width: 64px; text-transform: uppercase; padding: 2px 4px; }
+  input[type=number] { width: 62px; padding: 2px 4px; }
+  input[type=checkbox] { padding: 0; }
+  input[type=color] { width: 34px; height: 22px; padding: 0; border: 1px solid var(--inpbd); background: none; }
+  input[type=range] { width: 80px; padding: 0; }
+  button { cursor: pointer; }
+  button.on { background: #2962ff; border-color: #2962ff; color: #fff; }
+  button.dirty { background: #ff9800; border-color: #ff9800; color: #000; }
+  #stats { padding: 4px 12px; background: var(--bar); border-bottom: 1px solid var(--bd); font-size: 12px; color: var(--mut); }
+  #stats b { color: var(--txt); }
+  #hdr { display: flex; flex-wrap: wrap; gap: 14px; align-items: baseline; padding: 4px 12px; }
+  #sym { font-size: 17px; font-weight: bold; }
+  #ltp { font-size: 17px; font-weight: bold; }
+  #chg { font-size: 13px; }
+  .up { color: #26a69a; }
+  .down { color: #ef5350; }
+  #legend { color: var(--mut); font-size: 12px; white-space: pre; }
+  #main { flex: 1; min-height: 0; display: flex; }
+  #wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #cwrap { flex: 3; min-height: 0; position: relative; }
+  #chart { position: absolute; left: 0; top: 0; right: 0; bottom: 0; }
+  #ov { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
+  #tbl { position: absolute; right: 78px; bottom: 40px; display: none; border-collapse: collapse; font-size: 12px; pointer-events: none; z-index: 6; }
+  #tbl td { padding: 2px 8px; color: #fff; border: 1px solid var(--bg); }
+  #chart2 { flex: 1; min-height: 0; display: none; border-top: 1px solid var(--bd); }
+  #panel { display: none; width: 380px; overflow-y: auto; background: var(--pnl); border-left: 1px solid var(--bd); }
+  #ptop { position: sticky; top: 0; z-index: 8; display: flex; flex-wrap: wrap; gap: 5px; padding: 6px; background: var(--bar); border-bottom: 1px solid var(--bd); }
+  details { border-bottom: 1px solid var(--bd); }
+  summary { cursor: pointer; padding: 6px 8px; font-weight: bold; background: var(--sum); display: flex; align-items: center; gap: 6px; }
+  .fld { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 10px; }
+  .fld label { color: var(--mut); font-size: 12px; }
+  .fld .ctl { display: flex; align-items: center; gap: 5px; }
+  .opv { width: 28px; text-align: right; color: var(--mut); font-size: 11px; }
+  .mbtn { margin: 6px 10px; }
+  #foot { display: flex; gap: 8px; align-items: center; padding: 4px 12px; font-size: 11px; color: var(--foot); background: var(--bar); }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #787b86; display: inline-block; }
+  #dot.live { background: #26a69a; }
+  #dot.busy { background: #ffb300; }
+  #dot.err { background: #ef5350; }
+  body.focus #hdr { display: none; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="indbtn">Indicators</button>
+  <button id="savebtn" title="Save indicator + chart settings in this browser">💾 Save</button>
+  <button id="themebtn">☀ Light</button>
+  <button id="fsbtn" title="Full screen">⛶ Full screen</button>
+  <span id="info" style="color:var(--mut)"></span>
+</div>
+<div id="stats">Scanner data: -</div>
+<div id="hdr">
+  <span id="sym"></span><span id="ltp"></span><span id="chg"></span><span id="legend"></span>
+</div>
+<div id="main">
+  <div id="wrap">
+    <div id="cwrap">
+      <div id="chart"></div>
+      <canvas id="ov"></canvas>
+      <table id="tbl"></table>
+    </div>
+    <div id="chart2"></div>
+  </div>
+  <div id="panel"></div>
+</div>
+<div id="foot"><span id="dot"></span><span id="status">Starting...</span></div>
+
+<script>
+(function () {
+  var DATA = __DATA__;
+  var LIB_URLS = [
+    'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js',
+    'https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js'
+  ];
+  var STYLE_ID = { Solid: 0, Dotted: 1, Dashed: 2 };
+  var DASH = { Solid: [], Dotted: [2, 3], Dashed: [6, 4] };
+  var STYLES = ['Solid', 'Dashed', 'Dotted'];
+  var SRC = ['close', 'open', 'high', 'low', 'hl2', 'hlc3', 'ohlc4'];
+  var SHAPE_NAMES = ['Arrow Up', 'Arrow Down', 'Circle', 'Square'];
+  var SHAPES = { 'Arrow Up': 'arrowUp', 'Arrow Down': 'arrowDown', 'Circle': 'circle', 'Square': 'square' };
+
+  var state = { symbol: DATA.symbol, tf: DATA.tf, prevClose: DATA.prevClose || 0, base: [], candles: [], htf: [], spacing: 0, gap: null };
+  var chart = null, candleS = null, volS = null, volMaS = null, chart2 = null;
+  var SER = {}, touched = {}, MK = [], PLS = [], DR = { fills: [], boxes: [], shade: null };
+  var CT = null, pane2 = { kind: null, series: [], lines: [] }, syncing = false, applyTimer = null;
+  var modErrs = [], noTrack = true, ovErr = '', dirty = false, snapSaved = '', viewTimer = null, openIds = {};
+  var memStore = {};
+
+  function $(id) { return document.getElementById(id); }
+  function cmp(a, b) { return a < b ? -1 : (a > b ? 1 : 0); }
+  function fmt(n) { return (Math.round(n * 100) / 100).toFixed(2); }
+  function fmtVol(v) {
+    if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M';
+    if (v >= 1000) return (v / 1000).toFixed(1) + 'K';
+    return String(v);
+  }
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function setStatus(msg, kind) { $('status').textContent = msg; $('dot').className = kind || ''; }
+  function isNa(v) { return v === null || v === undefined || v !== v; }
+  function normHex(v) {
+    v = String(v || '').trim();
+    var m = /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.exec(v);
+    if (!m) return '';
+    var h = m[1];
+    if (h.length === 3) h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+    return '#' + h.toLowerCase();
+  }
+  function rgba(hex, op) {
+    var h = normHex(hex) || '#ffffff';
+    h = h.replace('#', '');
+    var r = parseInt(h.substr(0, 2), 16), g = parseInt(h.substr(2, 2), 16), b = parseInt(h.substr(4, 2), 16);
+    var a = Math.max(0, Math.min(100, op === undefined ? 100 : op)) / 100;
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+  }
+
+  // ---- browser storage (session = auto-kept while you work, local = 💾 Save) ----
+  function stGet(kind, key) {
+    try { return (kind === 's' ? window.sessionStorage : window.localStorage).getItem(key); }
+    catch (e) { return memStore[kind + key] || null; }
+  }
+  function stSet(kind, key, val) {
+    try { (kind === 's' ? window.sessionStorage : window.localStorage).setItem(key, val); }
+    catch (e) { memStore[kind + key] = val; }
+  }
+
+  // ================================================================
+  // SETTINGS SCHEMA  (field = [key, label, type, default, a, b, c])
+  //   types: b bool | i int | f float | c colour | o opacity % | w width | s line style | sel select
+  // ================================================================
+  var emaF = [];
+  [[true, 9, '#E040FB'], [true, 200, '#FDD835'], [true, 20, '#00BCD4'], [false, 50, '#FFFFFF'], [false, 100, '#FF9800']]
+    .forEach(function (e, i) {
+      var k = i + 1;
+      emaF.push(['show' + k, 'Show EMA ' + k, 'b', e[0]], ['len' + k, 'EMA ' + k + ' Length', 'i', e[1], 1, 2000, 1], ['col' + k, 'EMA ' + k + ' Color', 'c', e[2]]);
+    });
+  emaF.push(['op', 'Opacity %', 'o', 100], ['width', 'Line Thickness', 'w', 2], ['style', 'Line Style', 's', 'Solid']);
+
+  var DEFS = [
+    { id: 'chart', name: '0. Chart (theme / candles / volume)', noOn: true, f: [
+      ['theme', 'Theme', 'sel', 'Dark', ['Dark', 'Light']],
+      ['upCol', 'Up Candle Color', 'c', '#26A69A'], ['dnCol', 'Down Candle Color', 'c', '#EF5350'],
+      ['showVol', 'Show Volume Bars', 'b', true], ['volOp', 'Volume Bar Opacity %', 'o', 50],
+      ['showVolMA', 'Show Volume SMA line (inside volume bars)', 'b', true],
+      ['volMaLen', 'Volume SMA Length', 'i', 20, 1, 500, 1], ['volMaCol', 'Volume SMA Color', 'c', '#2962FF'], ['volMaW', 'Volume SMA Thickness', 'w', 1],
+      ['rightOff', 'Right Margin (bars)', 'i', 12, 0, 80, 1],
+      ['farScale', 'Include far levels (pivots / zones) in auto-scale', 'b', false]
+    ] },
+    { id: 'ema', name: '1. Exponential Moving Averages (EMA)', f: emaF },
+    { id: 'bb', name: '2. Bollinger Bands (BB Median / Upper / Lower)', f: [
+      ['len', 'Length', 'i', 20, 2, 1000, 1], ['src', 'Source', 'sel', 'close', SRC], ['mult', 'Multiplier', 'f', 2.0, 0.1, 20, 0.1],
+      ['offset', 'Offset', 'i', 0, -500, 500, 1],
+      ['showBasis', 'Show Median (Basis) Line', 'b', true], ['basisCol', 'Median (Basis) Color', 'c', '#2962FF'],
+      ['showUp', 'Show Upper Band', 'b', true], ['upCol', 'Upper Band Color', 'c', '#F23645'],
+      ['showLo', 'Show Lower Band', 'b', true], ['loCol', 'Lower Band Color', 'c', '#089981'],
+      ['fillOn', 'Show Background Fill (needs Upper + Lower)', 'b', true], ['fillCol', 'Background Fill Color', 'c', '#2196F3'], ['fillOp', 'Background Fill Opacity %', 'o', 7],
+      ['op', 'Line Opacity %', 'o', 100], ['width', 'Line Thickness', 'w', 1], ['style', 'Line Style', 's', 'Solid']
+    ] },
+    { id: 'sr', name: '3. Dynamic Support & Resistance', f: [
+      ['lookback', 'S/R Lookback Bars', 'i', 24, 1, 2000, 1], ['labels', 'Show Price Labels (R1 / S1)', 'b', true],
+      ['showRes', 'Show Resistance Line', 'b', true], ['resCol', 'Resistance Color', 'c', '#F23645'],
+      ['showSup', 'Show Support Line', 'b', true], ['supCol', 'Support Color', 'c', '#089981'],
+      ['op', 'Opacity %', 'o', 100], ['width', 'Line Thickness', 'w', 1], ['style', 'Line Style', 's', 'Dashed']
+    ] },
+    { id: 'vol', name: '4. Effective Volume Analyzer (see-through candles)', f: [
+      ['maLen', 'Volume MA Length', 'i', 20, 1, 500, 1], ['mult', 'High Volume Spurt Multiplier', 'f', 1.5, 0.1, 20, 0.1],
+      ['upCol', 'Bullish High-Volume Candle Color', 'c', '#4CAF50'], ['dnCol', 'Bearish High-Volume Candle Color', 'c', '#F23645'],
+      ['op', 'Candle Body Opacity % (low = see-through)', 'o', 20], ['edgeOp', 'Border / Wick Opacity %', 'o', 100]
+    ] },
+    { id: 'lux', name: '5. Lux Trendlines', f: [
+      ['len', 'Pivot Length', 'i', 14, 1, 200, 1], ['mult', 'ATR Multiplier', 'f', 1.0, 0.1, 20, 0.1],
+      ['showSig', 'Show B / S Breakout Markers', 'b', true],
+      ['showUp', 'Show Up (Resistance) Trendline', 'b', true], ['upCol', 'Up Trendline Color', 'c', '#12A79D'],
+      ['showDn', 'Show Down (Support) Trendline', 'b', true], ['dnCol', 'Down Trendline Color', 'c', '#F23645'],
+      ['op', 'Opacity %', 'o', 100], ['width', 'Line Thickness', 'w', 1], ['style', 'Line Style', 's', 'Dashed']
+    ] },
+    { id: 'pivots', name: '6. Traditional Pivot Points', f: [
+      ['tf', 'Pivot Timeframe', 'sel', 'D', ['D', 'W', 'M']],
+      ['onlyCur', 'Only current day / period (hide older steps)', 'b', false],
+      ['showP', 'Show Pivot (P)', 'b', true], ['pCol', 'Pivot Point (P) Color', 'c', '#2962FF'],
+      ['showR1', 'Show R1', 'b', true], ['showR2', 'Show R2', 'b', true], ['showR3', 'Show R3', 'b', true], ['rCol', 'Resistance Color', 'c', '#F23645'],
+      ['showS1', 'Show S1', 'b', true], ['showS2', 'Show S2', 'b', true], ['showS3', 'Show S3', 'b', true], ['sCol', 'Support Color', 'c', '#089981'],
+      ['op', 'Opacity %', 'o', 100], ['width', 'Line Thickness', 'w', 1], ['style', 'Line Style', 's', 'Dotted']
+    ] },
+    { id: 'dc', name: '7. Donchian Channels', f: [
+      ['len', 'Length', 'i', 20, 1, 1000, 1], ['offset', 'Offset', 'i', 0, -500, 500, 1],
+      ['showUp', 'Show Upper Channel', 'b', true], ['upCol', 'Upper Channel Color', 'c', '#2962FF'],
+      ['showLo', 'Show Lower Channel', 'b', true], ['loCol', 'Lower Channel Color', 'c', '#2962FF'],
+      ['showMid', 'Show Middle (Basis)', 'b', true], ['midCol', 'Middle (Basis) Color', 'c', '#FF9800'],
+      ['fillOn', 'Show Background Fill (needs Upper + Lower)', 'b', true], ['fillCol', 'Background Fill Color', 'c', '#2196F3'], ['fillOp', 'Background Fill Opacity %', 'o', 10],
+      ['op', 'Line Opacity %', 'o', 100], ['width', 'Line Thickness', 'w', 1], ['style', 'Line Style', 's', 'Solid']
+    ] },
+    { id: 'fractals', name: '8. Williams Fractals', f: [
+      ['bars', 'Fractal Left/Right Bars', 'i', 2, 1, 50, 1],
+      ['showUp', 'Show Top (Up) Fractals', 'b', true], ['upShape', 'Top Fractal Shape', 'sel', 'Arrow Up', SHAPE_NAMES], ['upCol', 'Top Fractal Color', 'c', '#089981'],
+      ['showDn', 'Show Bottom (Down) Fractals', 'b', true], ['dnShape', 'Bottom Fractal Shape', 'sel', 'Arrow Down', SHAPE_NAMES], ['dnCol', 'Bottom Fractal Color', 'c', '#F23645'],
+      ['size', 'Marker Size', 'f', 0.5, 0.2, 3, 0.1]
+    ] },
+    { id: 'dash', name: '9. Dashboard & Trend Meter', f: [
+      ['lookback', 'Lookback Period', 'i', 10, 1, 200, 1], ['thr', 'Uptrend Threshold', 'i', 8, 1, 200, 1],
+      ['showTbl', 'Show Table (Live Buy % / Trend)', 'b', true],
+      ['bgCol', 'Uptrend Background Color', 'c', '#089981'], ['bgOp', 'Uptrend Background Opacity %', 'o', 8]
+    ] },
+    { id: 'yash', name: '10. Yash Edge (dual-line zones + CPR)', f: [
+      ['onlyCur', 'Only current day (D / W / M: current period) - no older days', 'b', true],
+      ['showCpr', 'Show Central Pivot Line (CPR)', 'b', true],
+      ['zw', 'Zone Thickness (% of Range, e.g. 0.15)', 'f', 0.15, 0.05, 0.5, 0.05],
+      ['limit', 'Hide on Higher Timeframes (D, W, M)', 'b', false],
+      ['r1', 'Show R1', 'b', true], ['r2', 'Show R2', 'b', true], ['r3', 'Show R3', 'b', true],
+      ['s1', 'Show S1', 'b', true], ['s2', 'Show S2', 'b', true], ['s3', 'Show S3', 'b', true],
+      ['cprCol', 'CPR Line Color', 'c', '#2962FF'], ['resCol', 'Resistance Lines Color', 'c', '#E67814'], ['supCol', 'Support Lines Color', 'c', '#00B450'],
+      ['op', 'Opacity %', 'o', 100], ['width', 'Line Thickness', 'w', 1], ['style', 'Line Style', 's', 'Dashed']
+    ] },
+    { id: 'signals', name: '11. Smart Confluence Buy / Sell Signals', f: [
+      ['mode', 'Signal Strategy', 'sel', 'Confluence (EMA + SAR + Vol)', ['Confluence (EMA + SAR + Vol)', 'EMA Crossover Only', 'Lux Breakout + Vol']],
+      ['showBuy', 'Show Buy Signals', 'b', true], ['buyCol', 'Buy Signal Color', 'c', '#089981'],
+      ['showSell', 'Show Sell Signals', 'b', true], ['sellCol', 'Sell Signal Color', 'c', '#F23645'],
+      ['sarStart', 'SAR Start', 'f', 0.02, 0.001, 1, 0.001], ['sarInc', 'SAR Increment', 'f', 0.02, 0.001, 1, 0.001], ['sarMax', 'SAR Maximum', 'f', 0.2, 0.01, 2, 0.01]
+    ] },
+    { id: 'pro', name: '12. Pro Filtering & Risk Management', f: [
+      ['showVWAP', 'Show Daily VWAP', 'b', true], ['vwapCol', 'VWAP Color', 'c', '#FF9800'], ['vwapOp', 'VWAP Opacity %', 'o', 100],
+      ['vwapW', 'VWAP Line Thickness', 'w', 2], ['vwapStyle', 'VWAP Line Style', 's', 'Solid'],
+      ['useRVOL', 'Require RVOL Spike', 'b', true], ['rvolMin', 'RVOL Minimum', 'f', 1.5, 0.1, 50, 0.1], ['rvolLen', 'RVOL Volume MA Length', 'i', 20, 1, 500, 1],
+      ['useADX', 'Filter Chop with ADX', 'b', true], ['adxMin', 'ADX Minimum', 'f', 20, 1, 100, 1], ['adxLen', 'ADX / DI Length', 'i', 14, 1, 200, 1],
+      ['showSB', 'Show High-Confluence BUY (SB) markers', 'b', true], ['sbCol', 'High-Confluence BUY (SB) Color', 'c', '#089981'],
+      ['showSLTP', 'Show ATR SL / TP Lines', 'b', true], ['atrLen', 'ATR Length', 'i', 14, 1, 200, 1],
+      ['slMult', 'SL ATR Multiplier', 'f', 1.5, 0.1, 20, 0.1], ['tpMult', 'TP ATR Multiplier', 'f', 3.0, 0.1, 40, 0.1],
+      ['slCol', 'Stop Loss Color', 'c', '#F23645'], ['tpCol', 'Take Profit Color', 'c', '#089981'],
+      ['sltpOp', 'SL / TP Opacity %', 'o', 100], ['sltpW', 'SL / TP Line Thickness', 'w', 2], ['sltpStyle', 'SL / TP Line Style', 's', 'Solid']
+    ] },
+    { id: 'smc', name: '13. LuxAlgo Smart Money Concepts + HTF Highs/Lows', f: [
+      ['showStruct', 'Show Structure (BOS / CHoCH)', 'b', true], ['len', 'Swing Structure Length', 'i', 5, 1, 100, 1],
+      ['showOB', 'Show Order Blocks', 'b', true], ['obOp', 'Order Block Opacity %', 'o', 20],
+      ['showFVG', 'Show Fair Value Gaps (FVG)', 'b', true], ['fvgThr', 'FVG Min Threshold (%)', 'f', 0, 0, 20, 0.05],
+      ['fvgCol', 'Fair Value Gap Color', 'c', '#12A79D'], ['fvgOp', 'Fair Value Gap Opacity %', 'o', 30],
+      ['bullCol', 'Bullish Structure / OB Color', 'c', '#2962FF'], ['bearCol', 'Bearish Structure / OB Color', 'c', '#F23645'],
+      ['maxBoxes', 'Max Boxes Kept (latest)', 'i', 30, 1, 500, 1],
+      ['pdh', 'Show PDH (Prev Day High)', 'b', true], ['pdhCol', 'PDH Color', 'c', '#2962FF'],
+      ['pdl', 'Show PDL (Prev Day Low)', 'b', true], ['pdlCol', 'PDL Color', 'c', '#2962FF'],
+      ['pwh', 'Show PWH (Prev Week High)', 'b', true], ['pwhCol', 'PWH Color', 'c', '#9C27B0'],
+      ['pwl', 'Show PWL (Prev Week Low)', 'b', true], ['pwlCol', 'PWL Color', 'c', '#9C27B0'],
+      ['pmh', 'Show PMH (Prev Month High)', 'b', true], ['pmhCol', 'PMH Color', 'c', '#12A79D'],
+      ['pml', 'Show PML (Prev Month Low)', 'b', true], ['pmlCol', 'PML Color', 'c', '#12A79D'],
+      ['hlOp', 'High/Low Opacity %', 'o', 100], ['hlW', 'High/Low Line Thickness', 'w', 1], ['hlStyle', 'High/Low Line Style', 's', 'Dashed']
+    ] },
+    { id: 'pane', name: '14. Lower Pane (RSI / Volume Oscillator)', noOn: true, f: [
+      ['kind', 'Indicator', 'sel', 'None', ['None', 'RSI + its EMA', 'Volume Oscillator']],
+      ['rsiLen', 'RSI Length', 'i', 14, 2, 200, 1], ['rsiEma', 'RSI EMA Length', 'i', 34, 2, 200, 1],
+      ['rsiCol', 'RSI Color', 'c', '#7E57C2'], ['rsiEmaCol', 'RSI EMA Color', 'c', '#FF7043'],
+      ['rsiOp', 'RSI Opacity %', 'o', 100], ['rsiW', 'RSI Line Thickness', 'w', 1], ['rsiStyle', 'RSI Line Style', 's', 'Solid'],
+      ['voS', 'VO Short Length', 'i', 1, 1, 200, 1], ['voL', 'VO Long Length', 'i', 20, 2, 500, 1],
+      ['voUp', 'VO Color (>= 100)', 'c', '#26A69A'], ['voMid', 'VO Color (0..100)', 'c', '#26A69A'], ['voDn', 'VO Color (< 0)', 'c', '#EF5350']
+    ] }
+  ];
+
+  var S = {};
+  function defaultsFor(m) {
+    var o = {};
+    if (!m.noOn) o.on = true;
+    m.f.forEach(function (fd) { o[fd[0]] = fd[3]; });
+    return o;
+  }
+  DEFS.forEach(function (m) { S[m.id] = defaultsFor(m); });
+
+  function applySaved(js) {
+    if (!js) return;
+    try {
+      var sv = JSON.parse(js);
+      DEFS.forEach(function (m) {
+        if (!sv[m.id]) return;
+        Object.keys(S[m.id]).forEach(function (k) { if (sv[m.id][k] !== undefined) S[m.id][k] = sv[m.id][k]; });
+      });
+    } catch (e) { /* bad data - defaults are fine */ }
+  }
+
+  // Saved settings (permanent) first, then the working copy of this browser tab on top of it.
+  function loadSettings() {
+    applySaved(stGet('l', 'lc5_saved'));
+    snapSaved = JSON.stringify(S);
+    applySaved(stGet('s', 'lc5_work'));
+    try {
+      var v = JSON.parse(stGet('l', 'lc5_view') || '{}');
+      if (v.spacing > 0) state.spacing = Number(v.spacing);
+      if (typeof v.gap === 'number') state.gap = v.gap;
+    } catch (e) {}
+    try { openIds = JSON.parse(stGet('s', 'lc5_open') || '{}'); } catch (e2) { openIds = {}; }
+    dirty = JSON.stringify(S) !== snapSaved;
+  }
+
+  function refreshDirty() {
+    dirty = JSON.stringify(S) !== snapSaved;
+    $('savebtn').className = dirty ? 'dirty' : '';
+    $('savebtn').textContent = dirty ? '💾 Save*' : '💾 Save';
+  }
+  // every change: keep a working copy (survives the chart's auto-refresh) and update the Save button
+  function touch() {
+    stSet('s', 'lc5_work', JSON.stringify(S));
+    refreshDirty();
+  }
+  function saveSettings() {
+    snapSaved = JSON.stringify(S);
+    stSet('l', 'lc5_saved', snapSaved);
+    stSet('s', 'lc5_work', snapSaved);
+    refreshDirty();
+    setStatus('Settings saved in this browser. They load automatically every time.', 'live');
+  }
+
+  function scheduleApply() { clearTimeout(applyTimer); applyTimer = setTimeout(function () { applyAll(null); }, 120); }
+
+  // ================================================================
+  // THEME
+  // ================================================================
+  function themeCols() {
+    var L = S.chart.theme === 'Light';
+    return { bg: L ? '#ffffff' : '#131722', txt: L ? '#131722' : '#d1d4dc', grid: L ? '#eceef3' : '#1e222d', bd: L ? '#d0d3de' : '#2b2b43' };
+  }
+  function applyTheme() {
+    var L = S.chart.theme === 'Light', c = themeCols();
+    document.body.className = (L ? 'light ' : '') + (document.body.className.indexOf('focus') >= 0 ? 'focus' : '');
+    var o = {
+      layout: { background: { type: 'solid', color: c.bg }, textColor: c.txt },
+      grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+      rightPriceScale: { borderColor: c.bd }, timeScale: { borderColor: c.bd }
+    };
+    try { if (chart) chart.applyOptions(o); } catch (e) {}
+    try { if (chart2) chart2.applyOptions(o); } catch (e2) {}
+    $('themebtn').textContent = L ? '🌙 Dark' : '☀ Light';
+  }
+
+  // ================================================================
+  // SETTINGS PANEL
+  // ================================================================
+  function mkCtl(m, fd) {
+    var key = fd[0], t = fd[2], el, box = document.createElement('span');
+    box.className = 'ctl';
+    function put(v) { S[m.id][key] = v; touch(); if (m.id === 'chart' && key === 'theme') applyTheme(); scheduleApply(); }
+    if (t === 'b') {
+      el = document.createElement('input'); el.type = 'checkbox'; el.checked = !!S[m.id][key];
+      el.onchange = function () { put(el.checked); };
+      box.appendChild(el);
+    } else if (t === 'i' || t === 'f') {
+      el = document.createElement('input'); el.type = 'number';
+      el.min = fd[4]; el.max = fd[5]; el.step = fd[6] || (t === 'i' ? 1 : 0.1); el.value = S[m.id][key];
+      el.onchange = function () {
+        var v = parseFloat(el.value);
+        if (!isFinite(v)) v = fd[3];
+        v = Math.min(fd[5], Math.max(fd[4], v));
+        if (t === 'i') v = Math.round(v);
+        el.value = v; put(v);
+      };
+      box.appendChild(el);
+    } else if (t === 'c') {
+      var ci = document.createElement('input'); ci.type = 'color'; ci.value = normHex(S[m.id][key]) || '#ffffff';
+      var ti = document.createElement('input'); ti.type = 'text'; ti.className = 'hex'; ti.maxLength = 7; ti.value = ci.value.toUpperCase();
+      ti.title = 'Type any hex colour code, e.g. #FF5722';
+      ci.oninput = function () { ti.value = ci.value.toUpperCase(); put(ci.value); };
+      ti.onchange = function () {
+        var v = normHex(ti.value);
+        if (v) { ci.value = v; ti.value = v.toUpperCase(); put(v); }
+        else ti.value = ci.value.toUpperCase();
+      };
+      box.appendChild(ci); box.appendChild(ti);
+    } else if (t === 'o') {
+      el = document.createElement('input'); el.type = 'range'; el.min = 0; el.max = 100; el.step = 1; el.value = S[m.id][key];
+      var lab = document.createElement('span'); lab.className = 'opv'; lab.textContent = S[m.id][key];
+      el.oninput = function () { lab.textContent = el.value; };
+      el.onchange = function () { put(parseInt(el.value, 10)); };
+      box.appendChild(el); box.appendChild(lab);
+    } else {   // w (width), s (style), sel
+      el = document.createElement('select');
+      var opts = t === 'w' ? ['1', '2', '3', '4'] : (t === 's' ? STYLES : fd[4]);
+      opts.forEach(function (o) {
+        var op = document.createElement('option'); op.value = o; op.textContent = o; el.appendChild(op);
+      });
+      el.value = String(S[m.id][key]);
+      el.onchange = function () { put(t === 'w' ? parseInt(el.value, 10) : el.value); };
+      box.appendChild(el);
+    }
+    return box;
+  }
+
+  function buildPanel() {
+    var host = $('panel');
+    var keepScroll = host.scrollTop;
+    host.innerHTML = '';
+    var top = document.createElement('div'); top.id = 'ptop';
+    function tb(text, fn) { var b = document.createElement('button'); b.textContent = text; b.onclick = fn; top.appendChild(b); }
+    tb('💾 Save settings', saveSettings);
+    tb('Enable all', function () { DEFS.forEach(function (m) { if (!m.noOn) S[m.id].on = true; }); touch(); buildPanel(); applyAll(null); });
+    tb('Disable all', function () { DEFS.forEach(function (m) { if (!m.noOn) S[m.id].on = false; }); touch(); buildPanel(); applyAll(null); });
+    tb('Reset ALL', function () { DEFS.forEach(function (m) { S[m.id] = defaultsFor(m); }); touch(); buildPanel(); applyTheme(); applyAll(null); });
+    host.appendChild(top);
+
+    DEFS.forEach(function (m) {
+      var d = document.createElement('details');
+      d.open = !!openIds[m.id];
+      d.addEventListener('toggle', function () { openIds[m.id] = d.open; stSet('s', 'lc5_open', JSON.stringify(openIds)); });
+      var sm = document.createElement('summary');
+      if (!m.noOn) {
+        var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!S[m.id].on;
+        cb.onclick = function (e) { e.stopPropagation(); };
+        cb.onchange = function () { S[m.id].on = cb.checked; touch(); scheduleApply(); };
+        sm.appendChild(cb);
+      }
+      var nm = document.createElement('span'); nm.textContent = m.name; sm.appendChild(nm);
+      d.appendChild(sm);
+      m.f.forEach(function (fd) {
+        var row = document.createElement('div'); row.className = 'fld';
+        var lb = document.createElement('label'); lb.textContent = fd[1];
+        row.appendChild(lb); row.appendChild(mkCtl(m, fd));
+        d.appendChild(row);
+      });
+      var rb = document.createElement('button'); rb.className = 'mbtn'; rb.textContent = 'Reset this module';
+      rb.onclick = function () { S[m.id] = defaultsFor(m); touch(); buildPanel(); applyTheme(); applyAll(null); };
+      d.appendChild(rb);
+      host.appendChild(d);
+    });
+    host.scrollTop = keepScroll;
+  }
+
+  // ================================================================
+  // MATHS (all arrays are aligned with the candle array; null = not available)
+  // ================================================================
+  function firstValid(a) { for (var i = 0; i < a.length; i++) if (!isNa(a[i])) return i; return -1; }
+  function sma(a, len) {
+    var o = [], s = 0, i;
+    for (i = 0; i < a.length; i++) {
+      s += a[i]; if (i >= len) s -= a[i - len];
+      o.push(i >= len - 1 ? s / len : null);
+    }
+    return o;
+  }
+  function ema(a, len) {     // Pine ta.ema: SMA-seeded
+    var n = a.length, o = [], al = 2 / (len + 1), i, s = 0;
+    for (i = 0; i < n; i++) o.push(null);
+    if (n < len) return o;
+    for (i = 0; i < len; i++) s += a[i];
+    o[len - 1] = s / len;
+    for (i = len; i < n; i++) o[i] = a[i] * al + o[i - 1] * (1 - al);
+    return o;
+  }
+  function rma(a, len) {     // Pine ta.rma: SMA-seeded, skips leading nulls
+    var n = a.length, o = [], f = firstValid(a), i, s = 0;
+    for (i = 0; i < n; i++) o.push(null);
+    if (f < 0 || f + len > n) return o;
+    for (i = f; i < f + len; i++) s += a[i];
+    o[f + len - 1] = s / len;
+    for (i = f + len; i < n; i++) o[i] = (o[i - 1] * (len - 1) + a[i]) / len;
+    return o;
+  }
+  function stdev(a, len) {   // population stdev (ta.stdev)
+    var o = [], i, k, m, s;
+    for (i = 0; i < a.length; i++) {
+      if (i < len - 1) { o.push(null); continue; }
+      m = 0; for (k = i - len + 1; k <= i; k++) m += a[k]; m /= len;
+      s = 0; for (k = i - len + 1; k <= i; k++) s += (a[k] - m) * (a[k] - m);
+      o.push(Math.sqrt(s / len));
+    }
+    return o;
+  }
+  function rollMax(a, len, isMax) {
+    var o = [], i, k, r;
+    for (i = 0; i < a.length; i++) {
+      if (i < len - 1) { o.push(null); continue; }
+      r = a[i];
+      for (k = i - len + 1; k < i; k++) r = isMax ? Math.max(r, a[k]) : Math.min(r, a[k]);
+      o.push(r);
+    }
+    return o;
+  }
+  function shiftBy(a, off) {  // Pine plot offset: positive = shifted to the right
+    var o = [], i, j;
+    for (i = 0; i < a.length; i++) { j = i - off; o.push(j >= 0 && j < a.length ? a[j] : null); }
+    return o;
+  }
+  function pivotsOf(a, l, r, isHigh) {   // value of a confirmed pivot, placed on the CONFIRMATION bar
+    var n = a.length, o = [], i, j, k, v, ok;
+    for (i = 0; i < n; i++) {
+      o.push(null);
+      j = i - r;
+      if (j - l < 0) continue;
+      v = a[j]; ok = true;
+      for (k = j - l; k <= j + r; k++) {
+        if (k === j) continue;
+        if (isHigh ? a[k] > v : a[k] < v) { ok = false; break; }
+      }
+      if (ok) o[i] = v;
+    }
+    return o;
+  }
+  function trueRange(H, L, C) {
+    var o = [], i;
+    for (i = 0; i < H.length; i++) {
+      if (i === 0) o.push(H[i] - L[i]);
+      else o.push(Math.max(H[i] - L[i], Math.abs(H[i] - C[i - 1]), Math.abs(L[i] - C[i - 1])));
+    }
+    return o;
+  }
+  function atrOf(X, len) { return rma(trueRange(X.H, X.L, X.C), len); }
+  function adxOf(X, len) {   // Pine ta.dmi(len, len) -> ADX
+    var n = X.n, pd = [0], md = [0], i, up, dn;
+    for (i = 1; i < n; i++) {
+      up = X.H[i] - X.H[i - 1]; dn = X.L[i - 1] - X.L[i];
+      pd.push(up > dn && up > 0 ? up : 0);
+      md.push(dn > up && dn > 0 ? dn : 0);
+    }
+    var tr = rma(trueRange(X.H, X.L, X.C), len), p = rma(pd, len), m = rma(md, len), dx = [], pl, mi, sum;
+    for (i = 0; i < n; i++) {
+      if (isNa(tr[i]) || tr[i] === 0) { dx.push(null); continue; }
+      pl = 100 * p[i] / tr[i]; mi = 100 * m[i] / tr[i]; sum = pl + mi;
+      dx.push(Math.abs(pl - mi) / (sum === 0 ? 1 : sum));
+    }
+    var a = rma(dx, len);
+    return a.map(function (v) { return isNa(v) ? null : 100 * v; });
+  }
+  function sarSeries(H, L, C, st, inc, mx) {   // Pine ta.sar
+    var n = H.length, out = [], res = null, mm = null, acc = null, below = false, i, first;
+    for (i = 0; i < n; i++) out.push(null);
+    for (i = 1; i < n; i++) {
+      first = false;
+      if (i === 1) {
+        if (C[1] > C[0]) { below = true; mm = H[1]; res = L[0]; } else { below = false; mm = L[1]; res = H[0]; }
+        first = true; acc = st;
+      }
+      if (i >= 2) {
+        res = res + acc * (mm - res);
+        if (below) {
+          if (res > L[i]) { first = true; below = false; res = Math.max(H[i], mm); mm = L[i]; acc = st; }
+        } else {
+          if (res < H[i]) { first = true; below = true; res = Math.min(L[i], mm); mm = H[i]; acc = st; }
+        }
+        if (!first) {
+          if (below) { if (H[i] > mm) { mm = H[i]; acc = Math.min(acc + inc, mx); } }
+          else { if (L[i] < mm) { mm = L[i]; acc = Math.min(acc + inc, mx); } }
+        }
+      }
+      if (below) { res = Math.min(res, L[i - 1]); if (i > 1) res = Math.min(res, L[i - 2]); }
+      else { res = Math.max(res, H[i - 1]); if (i > 1) res = Math.max(res, H[i - 2]); }
+      out[i] = res;
+    }
+    return out;
+  }
+  function crossUp(a, b, i) { return i > 0 && !isNa(a[i]) && !isNa(b[i]) && !isNa(a[i - 1]) && !isNa(b[i - 1]) && a[i] > b[i] && a[i - 1] <= b[i - 1]; }
+  function crossDn(a, b, i) { return i > 0 && !isNa(a[i]) && !isNa(b[i]) && !isNa(a[i - 1]) && !isNa(b[i - 1]) && a[i] < b[i] && a[i - 1] >= b[i - 1]; }
+  function srcOf(X, name) {
+    if (name === 'open') return X.O; if (name === 'high') return X.H; if (name === 'low') return X.L;
+    var o = [], i;
+    for (i = 0; i < X.n; i++) {
+      if (name === 'hl2') o.push((X.H[i] + X.L[i]) / 2);
+      else if (name === 'hlc3') o.push((X.H[i] + X.L[i] + X.C[i]) / 3);
+      else if (name === 'ohlc4') o.push((X.O[i] + X.H[i] + X.L[i] + X.C[i]) / 4);
+      else o.push(X.C[i]);
+    }
+    return o;
+  }
+
+  // ---- higher time frame helpers (previous day / week / month) ----
+  function mondayOf(d) {
+    var p = d.split('-'), t = Date.UTC(+p[0], +p[1] - 1, +p[2]), dow = new Date(t).getUTCDay();
+    t -= ((dow + 6) % 7) * 86400000;
+    return new Date(t).toISOString().substr(0, 10);
+  }
+  function pkey(d, g) { return g === 'D' ? d : (g === 'W' ? mondayOf(d) : d.substr(0, 7)); }
+  function dailyList(X) {
+    if (state.htf.length) return state.htf;
+    var out = [], cur = null, i;           // fallback: build days from the loaded candles
+    for (i = 0; i < X.n; i++) {
+      if (!cur || cur.d !== X.D[i]) { cur = { d: X.D[i], h: X.H[i], l: X.L[i], c: X.C[i] }; out.push(cur); }
+      else { cur.h = Math.max(cur.h, X.H[i]); cur.l = Math.min(cur.l, X.L[i]); cur.c = X.C[i]; }
+    }
+    return out;
+  }
+  function buildPeriods(list, g) {
+    var out = [], cur = null, i, r, k;
+    for (i = 0; i < list.length; i++) {
+      r = list[i]; k = pkey(r.d, g);
+      if (!cur || cur.k !== k) { cur = { k: k, h: r.h, l: r.l, c: r.c }; out.push(cur); }
+      else { cur.h = Math.max(cur.h, r.h); cur.l = Math.min(cur.l, r.l); cur.c = r.c; }
+    }
+    return out;
+  }
+  function prevSeries(X, g) {   // previous-period High/Low/Close for every bar (like request.security high[1])
+    var per = buildPeriods(dailyList(X), g), h = [], l = [], c = [], brk = [], p = -1, lastK = null, i, k;
+    for (i = 0; i < X.n; i++) {
+      k = pkey(X.D[i], g);
+      while (p + 1 < per.length && per[p + 1].k < k) p++;
+      if (p >= 0) { h.push(per[p].h); l.push(per[p].l); c.push(per[p].c); } else { h.push(null); l.push(null); c.push(null); }
+      brk.push(k !== lastK); lastK = k;
+    }
+    return { h: h, l: l, c: c, brk: brk };
+  }
+  function prevOfLast(X, g) {
+    var per = buildPeriods(dailyList(X), g), k = pkey(X.D[X.n - 1], g), p = -1;
+    while (p + 1 < per.length && per[p + 1].k < k) p++;
+    return p >= 0 ? per[p] : null;
+  }
+  // keeps only the values that belong to the CURRENT day / week / month (everything older becomes null)
+  function onlyCurrent(arr, X, g) {
+    var k = pkey(X.D[X.n - 1], g);
+    return arr.map(function (v, i) { return pkey(X.D[i], g) === k ? v : null; });
+  }
+
+  // ---- timeframe aggregation (4H / W / M) ----
+  function aggHours(b, k) {
+    var out = [], cur = null, cnt = 0, day = null, i, c, d;
+    for (i = 0; i < b.length; i++) {
+      c = b[i]; d = Math.floor(c[0] / 86400);
+      if (d !== day || cnt >= k) { cur = [c[0], c[1], c[2], c[3], c[4], c[5]]; out.push(cur); day = d; cnt = 1; }
+      else { cur[2] = Math.max(cur[2], c[2]); cur[3] = Math.min(cur[3], c[3]); cur[4] = c[4]; cur[5] += c[5]; cnt++; }
+    }
+    return out;
+  }
+  function aggDaily(b, g) {
+    var out = [], cur = null, key = null, i, c, k;
+    for (i = 0; i < b.length; i++) {
+      c = b[i]; k = pkey(c[0], g);
+      if (!cur || k !== key) { cur = [c[0], c[1], c[2], c[3], c[4], c[5]]; out.push(cur); key = k; }
+      else { cur[2] = Math.max(cur[2], c[2]); cur[3] = Math.min(cur[3], c[3]); cur[4] = c[4]; cur[5] += c[5]; }
+    }
+    return out;
+  }
+  function aggregate(b, tf) {
+    if (tf === '4H') return aggHours(b, 4);
+    if (tf === 'W') return aggDaily(b, 'W');
+    if (tf === 'M') return aggDaily(b, 'M');
+    return b;
+  }
+
+  // ================================================================
+  // SERIES HELPERS
+  // ================================================================
+  function lineSer(key, vals, color, op, width, style, o) {
+    o = o || {};
+    touched[key] = 1;
+    var opts = {
+      color: rgba(color, op), lineWidth: width, lineStyle: STYLE_ID[style] || 0,
+      lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false, title: '',
+      autoscaleInfoProvider: (o.far && !S.chart.farScale) ? function () { return null; } : undefined
+    };
+    var s = SER[key];
+    if (!s) { s = chart.addLineSeries(opts); SER[key] = s; } else s.applyOptions(opts);
+    var data = [], i, v, p;
+    for (i = 0; i < CT.n; i++) {
+      v = vals[i];
+      if (isNa(v)) data.push({ time: CT.T[i] });
+      else {
+        p = { time: CT.T[i], value: v };
+        if (o.brk && o.brk[i]) p.color = 'rgba(0,0,0,0)';
+        data.push(p);
+      }
+    }
+    s.setData(data);
+  }
+  function rawSer(key, pts, color, op, width, style) {   // sparse series: [{i, v}, ...]
+    touched[key] = 1;
+    var opts = {
+      color: rgba(color, op), lineWidth: width, lineStyle: STYLE_ID[style] || 0,
+      lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false, title: '',
+      autoscaleInfoProvider: S.chart.farScale ? undefined : function () { return null; }
+    };
+    var s = SER[key];
+    if (!s) { s = chart.addLineSeries(opts); SER[key] = s; } else s.applyOptions(opts);
+    s.setData(pts.map(function (p) { return { time: CT.T[p.i], value: p.v }; }));
+  }
+  function mark(i, pos, shape, color, text, size) {
+    MK.push({ i: i, position: pos, shape: shape, color: color, text: text || '', size: size || 1 });
+  }
+  // full-width horizontal price line with an axis label (used by S/R and PDH / PDL / PWH ...)
+  function priceLine(price, title, col, op, w, style) {
+    if (isNa(price)) return;
+    PLS.push(candleS.createPriceLine({
+      price: price, color: rgba(col, op), lineWidth: w, lineStyle: STYLE_ID[style] || 0,
+      axisLabelVisible: true, title: title || ''
+    }));
+  }
+  function clearPriceLines() {
+    PLS.forEach(function (p) { try { candleS.removePriceLine(p); } catch (e) {} });
+    PLS = [];
+  }
+
+  // ================================================================
+  // CONTEXT + SHARED CALCULATIONS
+  // ================================================================
+  function makeCtx() {
+    var C = state.candles, n = C.length, X = { n: n, T: [], O: [], H: [], L: [], C: [], V: [], D: [], hv: null };
+    var i, c;
+    X.dailyTf = (state.tf === 'D' || state.tf === 'W' || state.tf === 'M');
+    for (i = 0; i < n; i++) {
+      c = C[i];
+      X.T.push(c[0]); X.O.push(c[1]); X.H.push(c[2]); X.L.push(c[3]); X.C.push(c[4]); X.V.push(c[5]);
+      X.D.push(typeof c[0] === 'string' ? c[0] : new Date(c[0] * 1000).toISOString().substr(0, 10));
+    }
+    return X;
+  }
+
+  function luxCalc(X) {   // Lux trendlines - needed by the Lux module AND by the signal / pro modules
+    var P = S.lux, n = X.n, u = [], l = [], buy = [], sell = [], i, up = null, lo = null;
+    for (i = 0; i < n; i++) { u.push(null); l.push(null); buy.push(false); sell.push(false); }
+    if (!P.on || n < 2 * P.len + 2) return { u: u, l: l, buy: buy, sell: sell, up: null, lo: null };
+    var ph = pivotsOf(X.H, P.len, P.len, true), pl = pivotsOf(X.L, P.len, P.len, false), atr = atrOf(X, P.len);
+    for (i = 0; i < n; i++) {
+      if (ph[i] !== null && !isNa(atr[i])) {
+        up = { x1: i - P.len, y1: ph[i], pb: -(atr[i] / P.len * P.mult) };
+      }
+      if (pl[i] !== null && !isNa(atr[i])) {
+        lo = { x1: i - P.len, y1: pl[i], pb: (atr[i] / P.len * P.mult) };
+      }
+      if (up) u[i] = up.y1 + up.pb * (i - up.x1);
+      if (lo) l[i] = lo.y1 + lo.pb * (i - lo.x1);
+      buy[i] = crossUp(X.C, u, i);
+      sell[i] = crossDn(X.C, l, i);
+    }
+    return { u: u, l: l, buy: buy, sell: sell, up: up, lo: lo };
+  }
+
+  // ================================================================
+  // MODULES
+  // ================================================================
+  var MODS = {};
+
+  MODS.vol = function (X, P) {            // 4. Effective Volume Analyzer: see-through candles on high volume
+    var ma = sma(X.V, P.maLen), hv = [], i, base;
+    for (i = 0; i < X.n; i++) {
+      if (!isNa(ma[i]) && X.V[i] > ma[i] * P.mult) {
+        base = X.C[i] >= X.O[i] ? P.upCol : P.dnCol;
+        hv.push({ body: rgba(base, P.op), edge: rgba(base, P.edgeOp) });
+      } else hv.push(null);
+    }
+    X.hv = hv;
+  };
+
+  MODS.ema = function (X, P) {            // 1. EMAs
+    for (var k = 1; k <= 5; k++) {
+      if (P['show' + k]) lineSer('ema' + k, ema(X.C, P['len' + k]), P['col' + k], P.op, P.width, P.style);
+    }
+  };
+
+  MODS.bb = function (X, P) {             // 2. Bollinger Bands
+    var src = srcOf(X, P.src), basis = sma(src, P.len), sd = stdev(src, P.len), up = [], lo = [], i;
+    for (i = 0; i < X.n; i++) {
+      if (isNa(basis[i])) { up.push(null); lo.push(null); }
+      else { up.push(basis[i] + P.mult * sd[i]); lo.push(basis[i] - P.mult * sd[i]); }
+    }
+    basis = shiftBy(basis, P.offset); up = shiftBy(up, P.offset); lo = shiftBy(lo, P.offset);
+    if (P.showBasis) lineSer('bbB', basis, P.basisCol, P.op, P.width, P.style);
+    if (P.showUp) lineSer('bbU', up, P.upCol, P.op, P.width, P.style);
+    if (P.showLo) lineSer('bbL', lo, P.loCol, P.op, P.width, P.style);
+    if (P.fillOn && P.showUp && P.showLo) DR.fills.push({ a: up, b: lo, col: rgba(P.fillCol, P.fillOp) });
+  };
+
+  MODS.sr = function (X, P) {             // 3. Dynamic S/R (highest high / lowest low of the lookback) - price lines
+    var n = X.n, from = Math.max(0, n - P.lookback), h = -Infinity, l = Infinity, i;
+    for (i = from; i < n; i++) { h = Math.max(h, X.H[i]); l = Math.min(l, X.L[i]); }
+    if (P.showRes) priceLine(h, P.labels ? 'R1: ' + h.toFixed(2) : '', P.resCol, P.op, P.width, P.style);
+    if (P.showSup) priceLine(l, P.labels ? 'S1: ' + l.toFixed(2) : '', P.supCol, P.op, P.width, P.style);
+  };
+
+  MODS.lux = function (X, P) {            // 5. Lux Trendlines (latest pair, extended to the last bar) + B / S
+    var L = X.lux, n = X.n;
+    if (P.showUp && L.up) rawSer('luxU', [{ i: L.up.x1, v: L.up.y1 }, { i: n - 1, v: L.u[n - 1] }], P.upCol, P.op, P.width, P.style);
+    if (P.showDn && L.lo) rawSer('luxL', [{ i: L.lo.x1, v: L.lo.y1 }, { i: n - 1, v: L.l[n - 1] }], P.dnCol, P.op, P.width, P.style);
+    if (P.showSig) {
+      for (var i = 0; i < n; i++) {
+        if (L.buy[i]) mark(i, 'belowBar', 'arrowUp', '#12A79D', 'B', 0.8);
+        if (L.sell[i]) mark(i, 'aboveBar', 'arrowDown', '#F23645', 'S', 0.8);
+      }
+    }
+  };
+
+  function levelLines(X, pv) {            // shared by Traditional Pivots
+    var pp = [], r1 = [], r2 = [], r3 = [], s1 = [], s2 = [], s3 = [], i, h, l, c, p, rg;
+    for (i = 0; i < X.n; i++) {
+      h = pv.h[i]; l = pv.l[i]; c = pv.c[i];
+      if (isNa(h)) { pp.push(null); r1.push(null); r2.push(null); r3.push(null); s1.push(null); s2.push(null); s3.push(null); continue; }
+      p = (h + l + c) / 3; rg = h - l;
+      pp.push(p); r1.push(2 * p - l); r2.push(p + rg); r3.push(h + 2 * (p - l));
+      s1.push(2 * p - h); s2.push(p - rg); s3.push(l - 2 * (h - p));
+    }
+    return { pp: pp, r1: r1, r2: r2, r3: r3, s1: s1, s2: s2, s3: s3 };
+  }
+
+  MODS.pivots = function (X, P) {         // 6. Traditional Pivot Points
+    var pv = prevSeries(X, P.tf), lv = levelLines(X, pv), o = { brk: pv.brk, far: true };
+    if (P.onlyCur) Object.keys(lv).forEach(function (k) { lv[k] = onlyCurrent(lv[k], X, P.tf); });
+    if (P.showP) lineSer('pvP', lv.pp, P.pCol, P.op, P.width, P.style, o);
+    ['r1', 'r2', 'r3'].forEach(function (k) { if (P['show' + k.toUpperCase()]) lineSer('pv' + k, lv[k], P.rCol, P.op, P.width, P.style, o); });
+    ['s1', 's2', 's3'].forEach(function (k) { if (P['show' + k.toUpperCase()]) lineSer('pv' + k, lv[k], P.sCol, P.op, P.width, P.style, o); });
+  };
+
+  MODS.dc = function (X, P) {             // 7. Donchian Channels
+    var up = rollMax(X.H, P.len, true), lo = rollMax(X.L, P.len, false), mid = [], i;
+    for (i = 0; i < X.n; i++) mid.push(isNa(up[i]) ? null : (up[i] + lo[i]) / 2);
+    up = shiftBy(up, P.offset); lo = shiftBy(lo, P.offset); mid = shiftBy(mid, P.offset);
+    if (P.showUp) lineSer('dcU', up, P.upCol, P.op, P.width, P.style);
+    if (P.showLo) lineSer('dcL', lo, P.loCol, P.op, P.width, P.style);
+    if (P.showMid) lineSer('dcM', mid, P.midCol, P.op, P.width, P.style);
+    if (P.fillOn && P.showUp && P.showLo) DR.fills.push({ a: up, b: lo, col: rgba(P.fillCol, P.fillOp) });
+  };
+
+  MODS.fractals = function (X, P) {       // 8. Williams Fractals (marker sits on the pivot bar, like offset=-bars)
+    var ph = pivotsOf(X.H, P.bars, P.bars, true), pl = pivotsOf(X.L, P.bars, P.bars, false), i;
+    var us = SHAPES[P.upShape] || 'arrowUp', ds = SHAPES[P.dnShape] || 'arrowDown';
+    for (i = 0; i < X.n; i++) {
+      if (P.showUp && ph[i] !== null) mark(i - P.bars, 'aboveBar', us, P.upCol, '', P.size);
+      if (P.showDn && pl[i] !== null) mark(i - P.bars, 'belowBar', ds, P.dnCol, '', P.size);
+    }
+  };
+
+  MODS.dash = function (X, P) {           // 9. Dashboard & Trend Meter
+    var n = X.n, bp = [], up = [], score = [], i, k, s;
+    for (i = 0; i < n; i++) bp.push(Math.round((X.C[i] - X.L[i]) / Math.max(X.H[i] - X.L[i], 1) * 100));
+    for (i = 0; i < n; i++) {
+      s = 0;
+      if (i > P.lookback) for (k = 0; k < P.lookback; k++) if (bp[i - k] >= 50) s++;
+      score.push(s); up.push(s >= P.thr);
+    }
+    DR.shade = { arr: up, col: rgba(P.bgCol, P.bgOp) };
+    var tb = $('tbl');
+    if (P.showTbl && n) {
+      var b = bp[n - 1], sc = score[n - 1];
+      tb.innerHTML =
+        '<tr><td style="background:#787b86">Live Buy %</td><td style="background:' + (b >= 50 ? '#089981' : '#F23645') + '">' + b + '%</td></tr>' +
+        '<tr><td style="background:#787b86">Trend</td><td style="background:' + (up[n - 1] ? '#089981' : '#FF9800') + '">' + sc + '/' + P.lookback + '</td></tr>';
+      tb.style.display = 'table';
+    } else tb.style.display = 'none';
+  };
+
+  MODS.yash = function (X, P) {           // 10. Yash Edge - CPR + dual-line R1-R3 / S1-S3 zones (current day only by default)
+    if (P.limit && X.dailyTf) return;
+    var g = state.tf === 'D' ? 'W' : ((state.tf === 'W' || state.tf === 'M') ? 'M' : 'D');
+    var pv = prevSeries(X, g), n = X.n, o = { brk: pv.brk, far: true };
+    var cpr = [], z = { r1t: [], r1b: [], r2t: [], r2b: [], r3t: [], r3b: [], s1t: [], s1b: [], s2t: [], s2b: [], s3t: [], s3b: [] };
+    var i, h, l, c, p, rg, hz, lv;
+    for (i = 0; i < n; i++) {
+      h = pv.h[i]; l = pv.l[i]; c = pv.c[i];
+      if (isNa(h)) { cpr.push(null); Object.keys(z).forEach(function (k) { z[k].push(null); }); continue; }
+      p = (h + l + c) / 3; rg = h - l; hz = rg * P.zw * 0.5;
+      cpr.push(p);
+      lv = { r1: 2 * p - l, r2: p + rg, r3: h + 2 * (p - l), s1: 2 * p - h, s2: p - rg, s3: l - 2 * (h - p) };
+      ['r1', 'r2', 'r3', 's1', 's2', 's3'].forEach(function (k) { z[k + 't'].push(lv[k] + hz); z[k + 'b'].push(lv[k] - hz); });
+    }
+    if (P.onlyCur) {
+      cpr = onlyCurrent(cpr, X, g);
+      Object.keys(z).forEach(function (k) { z[k] = onlyCurrent(z[k], X, g); });
+    }
+    if (P.showCpr) lineSer('yCpr', cpr, P.cprCol, P.op, 2, 'Dotted', o);
+    ['r1', 'r2', 'r3', 's1', 's2', 's3'].forEach(function (k) {
+      if (!P[k]) return;
+      var col = k.charAt(0) === 'r' ? P.resCol : P.supCol;
+      lineSer('y' + k + 't', z[k + 't'], col, P.op, P.width, P.style, o);
+      lineSer('y' + k + 'b', z[k + 'b'], col, P.op, P.width, P.style, o);
+    });
+  };
+
+  function vwapOf(X) {                    // daily VWAP, resets every IST date (each bar on D / W / M)
+    var o = [], pv = 0, vv = 0, day = null, i, tp;
+    for (i = 0; i < X.n; i++) {
+      if (X.D[i] !== day || X.dailyTf) { day = X.D[i]; pv = 0; vv = 0; }
+      tp = (X.H[i] + X.L[i] + X.C[i]) / 3;
+      pv += tp * X.V[i]; vv += X.V[i];
+      o.push(vv > 0 ? pv / vv : tp);
+    }
+    return o;
+  }
+
+  MODS.signals = function (X, P) {        // 11. Smart Confluence Buy / Sell Signals
+    var fast = ema(X.C, S.ema.len1), slow = ema(X.C, S.ema.len3);
+    var sar = sarSeries(X.H, X.L, X.C, P.sarStart, P.sarInc, P.sarMax);
+    var vma = sma(X.V, S.vol.maLen), i, vf, buy, sell, above, below;
+    for (i = 0; i < X.n; i++) {
+      vf = !isNa(vma[i]) && X.V[i] > vma[i];
+      above = !isNa(sar[i]) && X.C[i] > sar[i];
+      below = !isNa(sar[i]) && X.C[i] < sar[i];
+      if (P.mode === 'EMA Crossover Only') {
+        buy = crossUp(fast, slow, i); sell = crossDn(fast, slow, i);
+      } else if (P.mode === 'Lux Breakout + Vol') {
+        buy = X.lux.buy[i] && vf; sell = X.lux.sell[i] && vf;
+      } else {
+        buy = (crossUp(fast, slow, i) || (crossUp(X.C, fast, i) && above)) && vf;
+        sell = (crossDn(fast, slow, i) || (crossDn(X.C, fast, i) && below)) && vf;
+      }
+      if (P.showBuy && buy) mark(i, 'belowBar', 'arrowUp', P.buyCol, 'B', 1.2);
+      if (P.showSell && sell) mark(i, 'aboveBar', 'arrowDown', P.sellCol, 'S', 1.2);
+    }
+  };
+
+  MODS.pro = function (X, P) {            // 12. Pro Filtering & Risk Management
+    var n = X.n, vw = vwapOf(X), i;
+    if (P.showVWAP) lineSer('vwap', vw, P.vwapCol, P.vwapOp, P.vwapW, P.vwapStyle);
+    var vma = sma(X.V, P.rvolLen), adx = adxOf(X, P.adxLen), atr = atrOf(X, P.atrLen);
+    var conf = [], entry = null, sl = null, tp = null, slA = [], tpA = [], rv, trending, hiVol;
+    for (i = 0; i < n; i++) {
+      rv = isNa(vma[i]) || vma[i] === 0 ? null : X.V[i] / vma[i];
+      trending = !P.useADX || (!isNa(adx[i]) && adx[i] >= P.adxMin);
+      hiVol = !P.useRVOL || (rv !== null && rv >= P.rvolMin);
+      conf.push(X.lux.buy[i] && X.C[i] > vw[i] && trending && hiVol);
+      if (conf[i] && !isNa(atr[i])) { entry = X.C[i]; sl = X.C[i] - atr[i] * P.slMult; tp = X.C[i] + atr[i] * P.tpMult; }
+      if (entry !== null) { if (X.L[i] <= sl || X.H[i] >= tp) { entry = null; sl = null; tp = null; } }
+      slA.push(sl); tpA.push(tp);
+      if (P.showSB && conf[i]) mark(i, 'belowBar', 'arrowUp', P.sbCol, 'SB', 1.6);
+    }
+    if (P.showSLTP) {
+      var bs = [], bt = [];
+      for (i = 0; i < n; i++) {
+        bs.push(slA[i] !== null && (i === 0 || slA[i - 1] === null || slA[i - 1] !== slA[i]));
+        bt.push(tpA[i] !== null && (i === 0 || tpA[i - 1] === null || tpA[i - 1] !== tpA[i]));
+      }
+      lineSer('slL', slA, P.slCol, P.sltpOp, P.sltpW, P.sltpStyle, { brk: bs });
+      lineSer('tpL', tpA, P.tpCol, P.sltpOp, P.sltpW, P.sltpStyle, { brk: bt });
+    }
+  };
+
+  MODS.smc = function (X, P) {            // 13. LuxAlgo Smart Money Concepts + HTF highs / lows
+    var n = X.n, ph = pivotsOf(X.H, P.len, P.len, true), pl = pivotsOf(X.L, P.len, P.len, false);
+    var lastPh = [], lastPl = [], cph = null, cpl = null, i, obs = [], fvgs = [], gap;
+    for (i = 0; i < n; i++) {
+      if (ph[i] !== null) cph = ph[i];
+      if (pl[i] !== null) cpl = pl[i];
+      lastPh.push(cph); lastPl.push(cpl);
+    }
+    for (i = 0; i < n; i++) {
+      if (P.showStruct) {
+        if (crossUp(X.C, lastPh, i)) mark(i, 'belowBar', 'arrowUp', P.bullCol, 'BOS', 1);
+        if (crossDn(X.C, lastPl, i)) mark(i, 'aboveBar', 'arrowDown', P.bearCol, 'CHoCH', 1);
+      }
+      if (P.showOB && crossUp(X.C, lastPh, i) && i - P.len >= 0) {
+        obs.push({ l: i - P.len, r: i + 10, t: X.H[i - P.len], b: X.L[i - P.len], fill: rgba(P.bullCol, P.obOp), border: rgba(P.bullCol, 100), dash: 'Solid' });
+      }
+      if (P.showFVG && i >= 2 && X.L[i] > X.H[i - 2]) {
+        gap = (X.L[i] - X.H[i - 2]) / X.H[i - 2] * 100;
+        if (gap >= P.fvgThr) fvgs.push({ l: i - 2, r: i + 5, t: X.L[i], b: X.H[i - 2], fill: rgba(P.fvgCol, P.fvgOp), border: rgba(P.fvgCol, 100), dash: 'Dashed' });
+      }
+    }
+    obs.slice(-P.maxBoxes).concat(fvgs.slice(-P.maxBoxes)).forEach(function (b) { DR.boxes.push(b); });
+
+    var d = prevOfLast(X, 'D'), w = prevOfLast(X, 'W'), m = prevOfLast(X, 'M');
+    function add(on, per, key, name, col) {
+      if (!on || !per) return;
+      priceLine(per[key], name, col, P.hlOp, P.hlW, P.hlStyle);
+    }
+    add(P.pdh, d, 'h', 'PDH', P.pdhCol); add(P.pdl, d, 'l', 'PDL', P.pdlCol);
+    add(P.pwh, w, 'h', 'PWH', P.pwhCol); add(P.pwl, w, 'l', 'PWL', P.pwlCol);
+    add(P.pmh, m, 'h', 'PMH', P.pmhCol); add(P.pml, m, 'l', 'PML', P.pmlCol);
+  };
+
+  // ================================================================
+  // APPLY EVERYTHING
+  // ================================================================
+  function cp(i) {
+    var c = state.candles[i], p = { time: c[0], open: c[1], high: c[2], low: c[3], close: c[4] };
+    var col = CT && CT.hv ? CT.hv[i] : null;
+    if (col) { p.color = col.body; p.borderColor = col.edge; p.wickColor = col.edge; }
+    return p;
+  }
+  function vp(i) {
+    var c = state.candles[i];
+    return { time: c[0], value: c[5], color: rgba(c[4] >= c[1] ? S.chart.upCol : S.chart.dnCol, S.chart.volOp) };
+  }
+  function CT_isDaily() { return state.tf === 'D' || state.tf === 'W' || state.tf === 'M'; }
+
+  function applyVolMA() {
+    if (!volMaS) return;
+    var P = S.chart, n = state.candles.length, data = [], i;
+    volMaS.applyOptions({ color: rgba(P.volMaCol, 100), lineWidth: P.volMaW });
+    if (!P.showVol || !P.showVolMA || !n) { volMaS.setData([]); return; }
+    var ma = sma(state.candles.map(function (c) { return c[5]; }), P.volMaLen);
+    for (i = 0; i < n; i++) data.push(isNa(ma[i]) ? { time: state.candles[i][0] } : { time: state.candles[i][0], value: ma[i] });
+    volMaS.setData(data);
+  }
+
+  function applyAll() {
+    var n = state.candles.length;
+    if (!chart || !n) return;
+    var i;
+    modErrs = [];
+    try {
+      candleS.applyOptions({
+        upColor: S.chart.upCol, downColor: S.chart.dnCol, wickUpColor: S.chart.upCol, wickDownColor: S.chart.dnCol,
+        borderVisible: true, borderUpColor: S.chart.upCol, borderDownColor: S.chart.dnCol
+      });
+      chart.applyOptions({ timeScale: { rightOffset: S.chart.rightOff, timeVisible: !CT_isDaily() } });
+      CT = makeCtx();
+      CT.lux = luxCalc(CT);
+      touched = {}; MK = []; DR = { fills: [], boxes: [], shade: null };
+      clearPriceLines();
+      $('tbl').style.display = 'none';
+      ['vol', 'ema', 'bb', 'sr', 'lux', 'pivots', 'dc', 'fractals', 'dash', 'yash', 'signals', 'pro', 'smc'].forEach(function (id) {
+        if (!S[id].on) return;
+        try { MODS[id](CT, S[id]); } catch (e) { modErrs.push(id + ': ' + e.message); }
+      });
+      Object.keys(SER).forEach(function (k) {
+        if (!touched[k]) { try { chart.removeSeries(SER[k]); } catch (e) {} delete SER[k]; }
+      });
+
+      var cd = [], vd = [];
+      for (i = 0; i < n; i++) { cd.push(cp(i)); vd.push(vp(i)); }
+      candleS.setData(cd);
+      volS.setData(S.chart.showVol ? vd : []);
+      applyVolMA();
+
+      MK.sort(function (a, b) { return a.i - b.i; });
+      candleS.setMarkers(MK.filter(function (m) { return m.i >= 0 && m.i < n; }).map(function (m) {
+        return { time: CT.T[m.i], position: m.position, shape: m.shape, color: m.color, text: m.text, size: m.size };
+      }));
+      applyPane();
+    } catch (e2) {
+      modErrs.push('chart: ' + e2.message);
+    }
+    if (modErrs.length) setStatus('Indicator error (' + modErrs[0] + ')', 'err');
+    drawOv();
+  }
+
+  // ================================================================
+  // OVERLAY CANVAS (background fills, boxes, trend shading)
+  // ================================================================
+  function drawOv() {
+    try {
+      var cv = $('ov'), host = $('cwrap');
+      if (!cv || !host) return;
+      var w = host.clientWidth, h = host.clientHeight, dpr = window.devicePixelRatio || 1;
+      if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+      var g = cv.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, w, h);
+      if (!chart || !candleS || !state.candles.length || !CT) return;
+
+      var ts = chart.timeScale(), vr = ts.getVisibleLogicalRange();
+      if (!vr) return;
+      var n = state.candles.length, i0 = Math.max(0, Math.floor(vr.from) - 1), i1 = Math.min(n - 1, Math.ceil(vr.to) + 1);
+      var pw = w, ph = h;
+      try { pw = w - chart.priceScale('right').width(); ph = h - ts.height(); } catch (e) {}
+      g.save();
+      g.beginPath(); g.rect(0, 0, pw, ph); g.clip();
+
+      var X = function (i) { return ts.logicalToCoordinate(i); };
+      var Y = function (p) { return candleS.priceToCoordinate(p); };
+      var step = (i1 > i0) ? (X(i1) - X(i0)) / (i1 - i0) : 6;
+      var i, x, y, y2, seg;
+
+      if (DR.shade) {
+        g.fillStyle = DR.shade.col;
+        for (i = i0; i <= i1; i++) {
+          if (DR.shade.arr[i]) { x = X(i); if (x !== null) g.fillRect(x - step / 2, 0, step + 0.5, ph); }
+        }
+      }
+
+      DR.fills.forEach(function (f) {
+        g.fillStyle = f.col;
+        var j = i0;
+        while (j <= i1) {
+          while (j <= i1 && (isNa(f.a[j]) || isNa(f.b[j]))) j++;
+          if (j > i1) break;
+          seg = j;
+          while (j <= i1 && !isNa(f.a[j]) && !isNa(f.b[j])) j++;
+          var end = j - 1, k, ok = true, px = [], pa = [], pb = [];
+          for (k = seg; k <= end; k++) {
+            x = X(k); y = Y(f.a[k]); y2 = Y(f.b[k]);
+            if (x === null || y === null || y2 === null) { ok = false; break; }
+            px.push(x); pa.push(y); pb.push(y2);
+          }
+          if (!ok || px.length < 2) continue;
+          g.beginPath();
+          g.moveTo(px[0], pa[0]);
+          for (k = 1; k < px.length; k++) g.lineTo(px[k], pa[k]);
+          for (k = px.length - 1; k >= 0; k--) g.lineTo(px[k], pb[k]);
+          g.closePath(); g.fill();
+        }
+      });
+
+      DR.boxes.forEach(function (b) {
+        if (b.r < i0 || b.l > i1) return;
+        var xl = X(b.l), xr = X(b.r), yt = Y(b.t), yb = Y(b.b);
+        if (xl === null || xr === null || yt === null || yb === null) return;
+        g.fillStyle = b.fill; g.fillRect(xl, yt, xr - xl, yb - yt);
+        g.strokeStyle = b.border; g.lineWidth = 1; g.setLineDash(DASH[b.dash] || []);
+        g.strokeRect(xl, yt, xr - xl, yb - yt); g.setLineDash([]);
+      });
+      g.restore();
+      ovErr = '';
+    } catch (err) {
+      if (ovErr !== err.message) { ovErr = err.message; setStatus('Overlay (fills / boxes) error: ' + err.message, 'err'); }
+    }
+  }
+
+  // ================================================================
+  // LOWER PANE (RSI + EMA / Volume Oscillator)
+  // ================================================================
+  function destroyPane2() {
+    if (chart2) { try { chart2.remove(); } catch (e) {} }
+    chart2 = null; pane2 = { kind: null, series: [], lines: [] };
+    $('chart2').style.display = 'none';
+  }
+  function chartOptions() {
+    var c = themeCols();
+    return {
+      autoSize: true,
+      layout: { background: { type: 'solid', color: c.bg }, textColor: c.txt },
+      grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+      crosshair: { mode: 0 },
+      rightPriceScale: { borderColor: c.bd, minimumWidth: 72 },
+      timeScale: { borderColor: c.bd, timeVisible: !CT_isDaily(), secondsVisible: false, rightOffset: S.chart.rightOff }
+    };
+  }
+  function syncRange(r, other) {
+    if (syncing || !r || !other) return;
+    syncing = true;
+    try { other.timeScale().setVisibleLogicalRange(r); } catch (e) {}
+    syncing = false;
+  }
+  function wsPts(vals, from) {
+    var out = [], C = state.candles, i, v;
+    for (i = 0; i < C.length; i++) {
+      v = vals[i];
+      if (i >= from && !isNa(v)) out.push({ time: C[i][0], value: v }); else out.push({ time: C[i][0] });
+    }
+    return out;
+  }
+  function applyPane() {
+    var P = S.pane, kind = P.kind === 'RSI + its EMA' ? 'rsi' : (P.kind === 'Volume Oscillator' ? 'vo' : 'none');
+    if (kind === 'none' || !state.candles.length) { destroyPane2(); return; }
+    if (!chart2) {
+      $('chart2').style.display = 'block';
+      chart2 = LightweightCharts.createChart($('chart2'), chartOptions());
+      chart2.timeScale().subscribeVisibleLogicalRangeChange(function (r) { syncRange(r, chart); });
+      pane2 = { kind: null, series: [], lines: [] };
+    }
+    if (pane2.kind !== kind) {
+      pane2.series.forEach(function (s) { try { chart2.removeSeries(s); } catch (e) {} });
+      pane2.series = []; pane2.lines = [];
+      if (kind === 'rsi') {
+        var rs = chart2.addLineSeries({ title: 'RSI', priceLineVisible: false, autoscaleInfoProvider: function () { return { priceRange: { minValue: 0, maxValue: 100 } }; } });
+        var re = chart2.addLineSeries({ title: 'RSI EMA', priceLineVisible: false, lastValueVisible: false });
+        [70, 50, 30].forEach(function (p) { pane2.lines.push(rs.createPriceLine({ price: p, color: '#555a66', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })); });
+        pane2.series = [rs, re];
+      } else {
+        var vs = chart2.addHistogramSeries({ title: 'Vol Osc %', priceLineVisible: false });
+        [0, 100].forEach(function (p) { pane2.lines.push(vs.createPriceLine({ price: p, color: '#555a66', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })); });
+        pane2.series = [vs];
+      }
+      pane2.kind = kind;
+    }
+    var C = state.candles, closes = C.map(function (c) { return c[4]; }), i;
+    if (kind === 'rsi') {
+      var n = closes.length, alpha = 1 / P.rsiLen, ag = 0, al = 0, rsi = [], d, g2, l2, val;
+      for (i = 0; i < n; i++) {
+        d = i === 0 ? 0 : closes[i] - closes[i - 1];
+        g2 = d > 0 ? d : 0; l2 = d < 0 ? -d : 0;
+        if (i === 0) { ag = g2; al = l2; } else { ag = (1 - alpha) * ag + alpha * g2; al = (1 - alpha) * al + alpha * l2; }
+        val = 50;
+        if (i + 1 >= P.rsiLen && al !== 0) val = 100 - 100 / (1 + ag / al);
+        rsi.push(val);
+      }
+      var re2 = [], a2 = 2 / (P.rsiEma + 1);
+      for (i = 0; i < n; i++) re2.push(i === 0 ? rsi[0] : rsi[i] * a2 + re2[i - 1] * (1 - a2));
+      var st = { lineWidth: P.rsiW, lineStyle: STYLE_ID[P.rsiStyle] || 0 };
+      pane2.series[0].applyOptions({ color: rgba(P.rsiCol, P.rsiOp), lineWidth: st.lineWidth, lineStyle: st.lineStyle });
+      pane2.series[1].applyOptions({ color: rgba(P.rsiEmaCol, P.rsiOp), lineWidth: st.lineWidth, lineStyle: st.lineStyle });
+      pane2.series[0].setData(wsPts(rsi, P.rsiLen - 1));
+      pane2.series[1].setData(wsPts(re2, P.rsiLen - 1));
+    } else {
+      var es = ema(C.map(function (c) { return c[5]; }), P.voS), el = ema(C.map(function (c) { return c[5]; }), P.voL), vo = [];
+      for (i = 0; i < C.length; i++) vo.push(!isNa(es[i]) && !isNa(el[i]) && el[i] ? (es[i] - el[i]) / el[i] * 100 : null);
+      var data = wsPts(vo, 0);
+      data.forEach(function (dd) { if (dd.value !== undefined) dd.color = dd.value >= 100 ? P.voUp : (dd.value >= 0 ? rgba(P.voMid, 45) : P.voDn); });
+      pane2.series[0].setData(data);
+    }
+    chart2.applyOptions({ timeScale: { timeVisible: !CT_isDaily() } });
+    try {
+      var vr = chart.timeScale().getVisibleLogicalRange();
+      if (vr) { syncing = true; chart2.timeScale().setVisibleLogicalRange(vr); syncing = false; }
+    } catch (e) { syncing = false; }
+  }
+
+  // ================================================================
+  // CHART BUILD + DISPLAY
+  // ================================================================
+  function loadLib(i, cb) {
+    if (window.LightweightCharts) { cb(true); return; }
+    if (i >= LIB_URLS.length) { cb(false); return; }
+    var s = document.createElement('script');
+    s.src = LIB_URLS[i];
+    s.onload = function () { cb(!!window.LightweightCharts); };
+    s.onerror = function () { loadLib(i + 1, cb); };
+    document.head.appendChild(s);
+  }
+
+  function saveViewSoon() {
+    clearTimeout(viewTimer);
+    viewTimer = setTimeout(function () {
+      stSet('l', 'lc5_view', JSON.stringify({ spacing: state.spacing, gap: state.gap }));
+    }, 400);
+  }
+
+  function buildChart() {
+    var opts = chartOptions();
+    opts.rightPriceScale.scaleMargins = { top: 0.08, bottom: 0.25 };
+    chart = LightweightCharts.createChart($('chart'), opts);
+    candleS = chart.addCandlestickSeries({ upColor: S.chart.upCol, downColor: S.chart.dnCol, borderVisible: true, borderUpColor: S.chart.upCol, borderDownColor: S.chart.dnCol, wickUpColor: S.chart.upCol, wickDownColor: S.chart.dnCol });
+    volS = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol', lastValueVisible: false, priceLineVisible: false });
+    volMaS = chart.addLineSeries({ priceScaleId: 'vol', color: '#2962FF', lineWidth: 1, lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false, title: '' });
+    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+    chart.subscribeCrosshairMove(function (p) {
+      if (!p || !p.time || !p.seriesData) { legendLast(); return; }
+      var cd = p.seriesData.get(candleS);
+      if (!cd) { legendLast(); return; }
+      var vd = p.seriesData.get(volS);
+      legend([p.time, cd.open, cd.high, cd.low, cd.close, vd ? vd.value : 0]);
+    });
+    chart.timeScale().subscribeVisibleLogicalRangeChange(function (r) {
+      syncRange(r, chart2);
+      if (!noTrack && r && r.to > r.from) {      // remember the candle size / position the user chose
+        try {
+          var wd = chart.timeScale().width();
+          if (wd > 0) state.spacing = wd / (r.to - r.from);
+          state.gap = r.to - (state.candles.length - 1);
+          saveViewSoon();
+        } catch (e) {}
+      }
+      drawOv();
+    });
+    setInterval(drawOv, 150);     // follows vertical price-scale changes that have no event
+    applyTheme();
+  }
+
+  function legend(c) {
+    $('legend').textContent = 'O ' + fmt(c[1]) + '   H ' + fmt(c[2]) + '   L ' + fmt(c[3]) + '   C ' + fmt(c[4]) + '   Vol(' + state.tf + ') ' + fmtVol(c[5]);
+  }
+  function legendLast() { var n = state.candles.length; if (n) legend(state.candles[n - 1]); }
+  function renderHeader() {
+    var n = state.candles.length;
+    if (!n) return;
+    var last = state.candles[n - 1];
+    $('sym').textContent = state.symbol + '  ' + state.tf;
+    $('ltp').textContent = '₹' + fmt(last[4]);
+    var chg = $('chg');
+    if (state.prevClose > 0) {
+      var d = last[4] - state.prevClose, pct = d / state.prevClose * 100;
+      chg.className = d >= 0 ? 'up' : 'down';
+      chg.textContent = (d >= 0 ? '+' : '') + fmt(d) + ' (' + (d >= 0 ? '+' : '') + fmt(pct) + '%)';
+    } else chg.textContent = '';
+    legendLast();
+  }
+  function renderStats() {
+    var s = DATA.stats, el = $('stats');
+    if (!s) { el.textContent = 'Scanner data: not available for this symbol.'; return; }
+    el.innerHTML = 'Scanner data (' + esc(s.src) + '):&nbsp; Volume <b>' + esc(s.volume) + '</b> &nbsp;|&nbsp; Avg Vol <b>' + esc(s.avgVol) + '</b> &nbsp;|&nbsp; Vol M <b>' + esc(s.volM) + '</b>';
+  }
+  function showRange() {
+    var n = state.candles.length, ts = chart.timeScale();
+    var bars = state.tf === 'M' ? 60 : (state.tf === 'W' ? 100 : (state.tf === 'D' ? 160 : 140));
+    noTrack = true;
+    try {
+      if (state.spacing > 0) {          // keep the candle size / position the user chose
+        ts.applyOptions({ barSpacing: state.spacing });
+        ts.scrollToPosition(state.gap !== null ? state.gap : S.chart.rightOff, false);
+      } else {
+        ts.setVisibleLogicalRange({ from: Math.max(0, n - bars), to: n + S.chart.rightOff });
+      }
+    } catch (e) {}
+    setTimeout(function () { noTrack = false; }, 700);
+  }
+
+  // ---- full screen / focus mode ----
+  function focusMode() {
+    document.body.classList.toggle('focus');
+    setStatus(document.body.classList.contains('focus') ? 'Focus mode (header row hidden). Press the button again to return.' : 'Focus mode off.', '');
+    setTimeout(drawOv, 300);
+  }
+  function toggleFull() {
+    try {
+      if (document.fullscreenElement) { document.exitFullscreen(); return; }
+      var el = document.documentElement;
+      if (el.requestFullscreen) {
+        var p = el.requestFullscreen();
+        if (p && p.catch) p.catch(function () { focusMode(); });
+      } else focusMode();
+    } catch (e) { focusMode(); }
+  }
+
+  function boot() {
+    loadSettings();
+    state.htf = (DATA.htf || []).map(function (c) { return { d: c[0], o: c[1], h: c[2], l: c[3], c: c[4] }; });
+    state.base = DATA.candles || [];
+    state.candles = aggregate(state.base, state.tf);
+
+    $('info').textContent = DATA.symbol + ' · ' + DATA.tf + (DATA.refresh > 0 ? ' · auto-refresh ' + DATA.refresh + ' s' : ' · auto-refresh off');
+
+    var panel = $('panel');
+    if (stGet('s', 'lc5_panel') === '1') { panel.style.display = 'block'; $('indbtn').className = 'on'; }
+    buildPanel();
+    var ps = Number(stGet('s', 'lc5_pscroll') || 0);
+    if (ps > 0) panel.scrollTop = ps;
+    panel.addEventListener('scroll', function () { stSet('s', 'lc5_pscroll', String(panel.scrollTop)); });
+
+    $('indbtn').onclick = function () {
+      var open = panel.style.display === 'block';
+      panel.style.display = open ? 'none' : 'block';
+      $('indbtn').className = open ? '' : 'on';
+      stSet('s', 'lc5_panel', open ? '0' : '1');
+      setTimeout(drawOv, 200);
+    };
+    $('savebtn').onclick = saveSettings;
+    $('themebtn').onclick = function () {
+      S.chart.theme = S.chart.theme === 'Light' ? 'Dark' : 'Light';
+      touch(); buildPanel(); applyTheme(); applyAll();
+    };
+    $('fsbtn').onclick = toggleFull;
+    document.addEventListener('fullscreenchange', function () { setTimeout(drawOv, 300); });
+    window.addEventListener('resize', function () { setTimeout(drawOv, 200); });
+    refreshDirty();
+
+    buildChart();
+    renderStats();
+    if (!state.candles.length) { setStatus('No candle data for this symbol / timeframe.', 'err'); return; }
+    applyAll();
+    showRange();
+    renderHeader();
+    setStatus(DATA.marketOpen ? ('Live - updated ' + DATA.serverTime + ' IST (Kite)') : ('Market closed - last data ' + DATA.serverTime + ' IST (Kite)'), DATA.marketOpen ? 'live' : '');
+  }
+
+  loadLib(0, function (ok) {
+    if (!ok) { setStatus('Could not load the chart library (network blocked?).', 'err'); return; }
+    boot();
+  });
+})();
+</script>
+</body>
+</html>"""
+
+
+def build_live_chart_html(payload):
+    # "</" is escaped so no value can close the script tag early.
+    return LIVE_CHART_HTML.replace("__DATA__", json.dumps(payload).replace("</", "<\\/"))
+
+
+def draw_live_chart(kite_inst, symbol, instrument_token, prev_close, avg_vol, tf_label, height,
+                    refresh_secs, market_is_active, stats_source="Kite live"):
     interval, days = LIVE_CHART_TIMEFRAMES[tf_label]
-    df = fetch_live_chart_candles(kite_inst, instrument_token, interval, days)
-    if df is None or df.empty:
+    hist = fetch_live_chart_candles(kite_inst, instrument_token, interval, days)
+    if not hist:
         st.info("No candle data available for this symbol / timeframe.")
         return
 
     daily = interval == "day"
-    candles, volumes, ema9, ema21 = _live_chart_series(df, daily)
+    rows = _live_chart_rows(hist, daily)
+    htf = rows if daily else fetch_live_chart_htf(st.session_state.access_token, API_KEY, instrument_token)
 
-    chart_options = {
-        "height": height,
-        "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#D1D4DC"},
-        "grid": {"vertLines": {"color": "#1E222D"}, "horzLines": {"color": "#1E222D"}},
-        "crosshair": {"mode": 0},
-        "rightPriceScale": {"borderColor": "#2B2B43"},
-        "timeScale": {"borderColor": "#2B2B43", "timeVisible": not daily, "secondsVisible": False},
+    # Live Volume / Avg Vol / Vol M (the same three numbers as the dashboard columns).
+    vol_live = None
+    try:
+        qd = kite_inst.quote([f"NSE:{symbol}"]).get(f"NSE:{symbol}")
+        if qd:
+            vol_live = qd.get("volume")
+            if not prev_close:
+                prev_close = float((qd.get("ohlc") or {}).get("close", 0) or 0)
+    except Exception:
+        pass
+
+    stats = None
+    if vol_live is not None:
+        avg_ok = avg_vol and 0 < avg_vol < 999999999
+        stats = {
+            "volume": format_volume_short(vol_live),
+            "avgVol": format_volume_short(avg_vol) if avg_ok else "N/A",
+            "volM": format_volume_multiple(vol_live / avg_vol) if avg_ok else "N/A",
+            "src": stats_source,
+        }
+
+    payload = {
+        "symbol": symbol,
+        "tf": tf_label,
+        "prevClose": float(prev_close or 0),
+        "candles": rows,
+        "htf": htf,
+        "stats": stats,
+        "serverTime": datetime.now(IST).strftime("%H:%M:%S"),
+        "marketOpen": bool(market_is_active),
+        "refresh": int(refresh_secs or 0),
     }
-
-    series = [
-        {"type": "Candlestick", "data": candles,
-         "options": {"upColor": LIVE_CHART_UP, "downColor": LIVE_CHART_DOWN, "borderVisible": False,
-                     "wickUpColor": LIVE_CHART_UP, "wickDownColor": LIVE_CHART_DOWN}},
-        {"type": "Line", "data": ema9,
-         "options": {"color": "#FFB300", "lineWidth": 1, "title": "EMA9"}},
-        {"type": "Line", "data": ema21,
-         "options": {"color": "#42A5F5", "lineWidth": 1, "title": "EMA21"}},
-        {"type": "Histogram", "data": volumes,
-         "options": {"priceFormat": {"type": "volume"}, "priceScaleId": "",
-                     "priceLineVisible": False, "lastValueVisible": False},
-         "priceScaleOptions": {"scaleMargins": {"top": 0.8, "bottom": 0}}},
-    ]
-
-    last = df.iloc[-1]
-    chg = (last["close"] - df.iloc[-2]["close"]) if len(df) > 1 else 0.0
-    st.caption(
-        f"**{symbol}** · {tf_label} · Last ₹{last['close']:.2f} ({chg:+.2f}) · "
-        f"Updated {datetime.now(IST).strftime('%H:%M:%S')} IST · source: Kite (live)"
-    )
-    renderLightweightCharts(
-        [{"chart": chart_options, "series": series}],
-        key=f"lwc_{symbol}_{tf_label}",
-    )
+    components.html(build_live_chart_html(payload), height=height, scrolling=False)
 
 
-def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active):
+def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active,
+                              groups=None, prev_close_lookup=None, avg_vol_lookup=None):
+    import re as _re
+
     st.divider()
     st.header("📈 View Live Chart")
 
-    if not symbol_options:
+    groups = {k: v for k, v in (groups or {"All scanner symbols": symbol_options}).items() if v}
+    if not groups:
         st.info("No symbols available to chart yet.")
         return
+    prev_close_lookup = prev_close_lookup or {}
+    avg_vol_lookup = avg_vol_lookup or {}
 
-    lc1, lc2, lc3, lc4 = st.columns([3, 2, 2, 2])
-    symbol = lc1.selectbox("Symbol", symbol_options, key="livechart_sym")
-    tf_label = lc2.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True,
-                         key="livechart_tf")
-    height = lc3.slider("Height", 350, 900, 550, 50, key="livechart_h")
-    live = lc4.toggle("Live (5s)", value=market_is_active, key="livechart_live",
-                      help="Re-pulls the forming candle from Kite every 5 seconds. "
-                           "Only the chart reruns, not the whole scanner.")
+    r1a, r1b, r1c = st.columns([2, 3, 2])
+    src = r1a.selectbox("Page / list", list(groups), key="livechart_src")
+    picked = r1b.selectbox("Symbol", groups[src], key=f"livechart_sym_{src}")
+    typed = r1c.text_input("Or type any NSE symbol", key="livechart_typed",
+                           help="Leave empty to use the symbol picked on the left.").strip().upper()
+    symbol = typed if (typed and _re.fullmatch(r"[A-Z0-9&_.\- ]{1,30}", typed)) else picked
+
+    r2a, r2b, r2c = st.columns([4, 2, 2])
+    tf_label = r2a.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True, key="livechart_tf")
+    height = r2b.slider("Height", 450, 1000, 700, 50, key="livechart_h")
+    refresh_secs = r2c.selectbox(
+        "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
+        index=LIVE_CHART_REFRESH_OPTIONS.index(15) if market_is_active else 0,
+        format_func=lambda x: "Off" if x == 0 else f"{x} s", key="livechart_refresh",
+        help="Re-pulls the forming candle from Kite. Only the chart reruns, not the whole scanner. "
+             "Set it to Off while you are changing indicator settings."
+    )
 
     token = token_lookup.get(symbol)
+    prev_close = prev_close_lookup.get(symbol, 0.0)
     if not token:
-        st.warning("Instrument token not found for this symbol.")
+        info = fetch_live_chart_symbol_info(st.session_state.access_token, API_KEY, symbol)
+        if info:
+            token = info["token"]
+            prev_close = prev_close or info["prevClose"]
+    if not token:
+        st.warning(f"Instrument token not found for {symbol}.")
         return
 
-    if live and hasattr(st, "fragment"):
-        @st.fragment(run_every=5)
-        def _live_fragment():
-            draw_live_chart(kite_inst, symbol, token, tf_label, height)
-        _live_fragment()
+    avg_vol = avg_vol_lookup.get(symbol, 0)
+    src_label = "Kite live" if symbol in avg_vol_lookup else "Kite live, no 20D avg for this symbol"
+
+    def _draw():
+        draw_live_chart(kite_inst, symbol, token, prev_close, avg_vol, tf_label, height,
+                        refresh_secs, market_is_active, src_label)
+
+    if refresh_secs and hasattr(st, "fragment"):
+        st.fragment(run_every=refresh_secs)(_draw)()
     else:
-        draw_live_chart(kite_inst, symbol, token, tf_label, height)
+        _draw()
+
+    st.caption("Indicator settings are stored in this browser: changes are kept while you work, "
+               "press 💾 Save inside the chart to keep them for good. Full screen: ⛶ button inside the chart.")
 
 
 # --- 6. SIDEBAR ---
@@ -1772,13 +3175,56 @@ if 'access_token' in st.session_state:
             st.info("No active managed trades currently tracked.")
 
         # --- LIVE INTERACTIVE CHART (TradingView lightweight-charts, Kite live data) ---
-        chart_symbols = list(dict.fromkeys(df_full["Symbol"].tolist()))
+        # (EDIT 2: replaces the old call block at the very bottom of the script; keep the 8-space indent, inside "if results:")
+        def _uniq(seq):
+            return list(dict.fromkeys([
+                str(x).strip().upper() for x in seq
+                if str(x).strip() and str(x).strip().upper() not in ("NAN", "SYMBOL", "INDEX")
+            ]))
+
+        chart_symbols = _uniq(df_full["Symbol"].tolist())
         token_lookup = {
             _s.replace("NSE:", ""): _q["instrument_token"]
             for _s, _q in full_quotes.items() if "instrument_token" in _q
         }
+        prev_close_lookup = {
+            _s.replace("NSE:", ""): float((_q.get("ohlc") or {}).get("close", 0) or 0)
+            for _s, _q in full_quotes.items()
+        }
+        avg_vol_lookup = {_s.replace("NSE:", ""): _v for _s, _v in avg_vols_20.items()}
+
+        _active_now = load_active_trades()
+        for _s, _t in _active_now.items():
+            if _t.get("instrument_token"):
+                token_lookup.setdefault(_s, _t["instrument_token"])
+
+        _gs_syms = []
+        if not df_sheet_log.empty and "Symbol" in df_sheet_log.columns:
+            _gs_syms = _uniq(df_sheet_log["Symbol"].tolist())
+
+        _vol_syms = (
+            _uniq(df_display[df_display["Daily VO %"] > 0]["Symbol"].tolist())
+            if "Daily VO %" in df_display.columns else []
+        )
+        _dc_syms = (
+            _uniq(df_display[df_display["DC 15m"].astype(str).str.contains("🚀", na=False)]["Symbol"].tolist())
+            if "DC 15m" in df_display.columns else []
+        )
+
+        chart_groups = {
+            "All scanner symbols": chart_symbols,
+            "🚀 Happy Breakout": _uniq(df_combo["Symbol"].tolist()),
+            "🚩 Early Watchlist": _uniq(df_early["Symbol"].tolist()),
+            "📊 Market (filtered)": _uniq(df_display["Symbol"].tolist()),
+            "🔥 Volume": _vol_syms,
+            "📈 Donchian 15m": _dc_syms,
+            "📋 GSheet Alert_Log": _gs_syms,
+            "🎯 Active Trades": _uniq(list(_active_now.keys())),
+        }
+
         render_live_chart_section(
-            st.session_state.kite, chart_symbols, token_lookup, market_active
+            st.session_state.kite, chart_symbols, token_lookup, market_active,
+            groups=chart_groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup
         )
 
 else:
