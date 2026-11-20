@@ -182,6 +182,32 @@ ACTIVE_TRADES_FILE = "active_trades.json"
 # thickness, style), 💾 Save, Light/Dark, Full-screen, timeframes
 # 3m 5m 15m 1H 4H D W M, scanner-list symbol picker (+ any typed NSE symbol),
 # and a Volume / Avg Vol / Vol M stats row. Nothing else in the scanner changed.
+#
+# V6 — HAPPY BREAKOUT 2.0 (new default alert) + OLD THREE ALERTS DEFAULT OFF
+# A single new alert tier, "Happy Breakout 2.0" (💎), is now the default,
+# priority alert for the dashboard tab AND for PC/Telegram notifications.
+# It fires only when ALL 8 conditions are true:
+#   (1) Vol Multiple >= 1.1x (live volume / 20-day avg volume)
+#   (2) Volume >= 150,000
+#   (3) Daily Volume Oscillator (1, 20) >= +100%
+#   (4) 15m Donchian (28, offset 6): close >= upper channel
+#   (5) Change % vs previous close >= 1%
+#   (6) 15m RSI(14) >= 60
+#   (7) 15m RSI above its own 34-EMA
+# (The 8th item is simply the same-day list below, not a trigger condition.)
+# SAME-DAY TRIGGERED STOCKS LIST: a new section at the very bottom of the
+# page lists every stock that fired a PC/Telegram entry alert TODAY (IST),
+# with trigger time, trigger LTP, current LTP and the % move since trigger.
+# It is persisted in todays_triggers.json so an app/PC restart does not lose
+# it, and it resets automatically on the next calendar day.
+# The three older alerts — Happy Breakout, Early Watchlist and HAPPY SF
+# (the "Individual Donchian Alerts" toggle) — are KEPT in the code, with
+# their conditions and sidebar toggles UNCHANGED, but their toggles now
+# default to OFF so you can switch them on whenever you need them.
+# Happy Breakout 2.0 is checked FIRST in the alert chain. The Gap-Up
+# Opening Range Filter (V4) still gates every alert tier, including this one.
+# Dedup for 2.0 is persistent (active_trades.json flag "alerted_happy2"),
+# exactly like the other two tiers, and it feeds the same 9/21-EMA exit engine.
 # ----------------------------------------------------------------
 
 # LEGACY (no longer used by is_early_watchlist — kept only for reference/
@@ -196,7 +222,7 @@ HAPPY_BREAKOUT_MIN_VOLUME = 500_000
 HAPPY_BREAKOUT_RSI_THRESHOLD = 70
 
 DAILY_VO_THRESHOLD = 100.0
-PRICE_MOVE_PCT_THRESHOLD = 1.0  # vs PrevClose, matches existing "pct" field; used by Happy Breakout only
+PRICE_MOVE_PCT_THRESHOLD = 1.0  # vs PrevClose, matches existing "pct" field; used by Happy Breakout, Early Watchlist and Happy Breakout 2.0
 
 # PDH BREAK MIRROR — same threshold and meaning as the Google Sheet's
 # PDH_VOL_MULTIPLE_THRESHOLD (Master Key script, PDH Break section): Volume
@@ -206,6 +232,12 @@ PDH_VOL_MULTIPLE_THRESHOLD = 1.5
 # HAPPY SF: Donchian 15m Upper Breakout + Volume Multiple threshold
 HAPPY_SF_VOL_MULTIPLE = 1.1
 
+# HAPPY BREAKOUT 2.0 (V6) — the new default alert tier
+HB2_VOL_MULTIPLE = 1.1          # Vol Multiple >= this
+HB2_MIN_VOLUME = 150_000        # Volume >= this
+HB2_RSI_THRESHOLD = 60          # 15m RSI(14) >= this
+HB2_VO_THRESHOLD = 100.0        # Daily Volume Oscillator (1,20) >= this (%)
+
 # GAP-UP OPENING RANGE FILTER
 GAP_UP_PCT_THRESHOLD = 1.5            # open vs previous close, in %
 OPENING_RANGE_START = dtime(9, 15)    # first 15m candle of the session
@@ -213,6 +245,7 @@ OPENING_RANGE_END = dtime(9, 45)      # range = candles starting 9:15 and 9:30
 
 EARLY_WATCHLIST_EMOJI = "🚩"
 HAPPY_BREAKOUT_EMOJI = "🟢"
+HAPPY_BREAKOUT2_EMOJI = "💎"
 
 # --- BOOK PROFIT (optional, toggle OFF by default) ---
 BOOK_PROFIT_RSI_THRESHOLD = 90.0   # 15m RSI >= this -> "BOOK PROFIT" alert
@@ -220,12 +253,12 @@ BOOK_PROFIT_EMOJI = "💰"
 
 # --- PERSISTENT ACTIVE TRADES STORAGE UTILS ---
 # active_trades.json is the single source of truth for both (a) exit
-# monitoring and (b) alert dedup. Each entry carries "alerted_early" and
-# "alerted_happy" flags: a given tier only fires once per lifecycle (from
-# first trigger until Final Exit removes the entry entirely). Because this
-# lives on disk, a PC/app restart does NOT cause duplicate alerts for a
-# still-ongoing signal — only a genuine Final Exit, followed by conditions
-# becoming true again, allows a fresh alert.
+# monitoring and (b) alert dedup. Each entry carries "alerted_early",
+# "alerted_happy" and (V6) "alerted_happy2" flags: a given tier only fires
+# once per lifecycle (from first trigger until Final Exit removes the entry
+# entirely). Because this lives on disk, a PC/app restart does NOT cause
+# duplicate alerts for a still-ongoing signal — only a genuine Final Exit,
+# followed by conditions becoming true again, allows a fresh alert.
 
 def load_active_trades():
     if "active_trades" not in st.session_state:
@@ -246,6 +279,52 @@ def save_active_trades(trades):
             json.dump(trades, f, indent=4)
     except Exception:
         pass
+
+# --- V6: SAME-DAY TRIGGERED STOCKS LOG ---
+# Every PC/Telegram entry alert (any tier) is also appended here, once per
+# symbol + alert type per calendar day (IST). Persisted to disk so a restart
+# doesn't lose today's list; automatically starts empty on a new day.
+TODAY_TRIGGERS_FILE = "todays_triggers.json"
+
+def _write_todays_triggers(data):
+    try:
+        with open(TODAY_TRIGGERS_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception:
+        pass
+
+def load_todays_triggers():
+    today_key = datetime.now(IST).strftime("%Y-%m-%d")
+    data = st.session_state.get("todays_triggers")
+    if data is None:
+        data = {}
+        if os.path.exists(TODAY_TRIGGERS_FILE):
+            try:
+                with open(TODAY_TRIGGERS_FILE, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+    if not isinstance(data, dict) or data.get("date") != today_key:
+        data = {"date": today_key, "entries": []}
+        _write_todays_triggers(data)
+    st.session_state["todays_triggers"] = data
+    return data
+
+def log_todays_trigger(symbol, alert_type, score, ltp, chart_url=""):
+    data = load_todays_triggers()
+    for e in data["entries"]:
+        if e.get("Symbol") == symbol and e.get("Type") == alert_type:
+            return  # already logged today
+    data["entries"].append({
+        "Symbol": symbol,
+        "Type": alert_type,
+        "Score": score,
+        "Time": datetime.now(IST).strftime("%H:%M:%S"),
+        "Trigger LTP": float(ltp),
+        "Chart": chart_url
+    })
+    st.session_state["todays_triggers"] = data
+    _write_todays_triggers(data)
 
 # --- TECHNICAL HELPERS: RSI, EMA & VOLUME OSCILLATOR ---
 
@@ -457,10 +536,10 @@ def send_telegram_raw(message):
 
 def send_telegram_alert(symbol, alert_type, ltp, score_emoji, chart_url=""):
     """
-    Message format: Score line is the tier emoji (🚩 Early Watchlist /
-    🟢 Happy Breakout) or the legacy numeric score for the untouched
-    Volume/Donchian toggles. No SL lines — SL conditions were removed
-    entirely; exits are handled purely by the EMA exit engine.
+    Message format: Score line is the tier emoji (💎 Happy Breakout 2.0 /
+    🟢 Happy Breakout / 🚩 Early Watchlist) or the legacy numeric score for
+    the untouched Volume/Donchian toggles. No SL lines — SL conditions were
+    removed entirely; exits are handled purely by the EMA exit engine.
     """
     chart_link = f'<a href="{chart_url}">Open TV \u2197</a>' if chart_url else ""
     message = (
@@ -663,7 +742,8 @@ def get_last_closed_candle_index(df, interval_minutes=15):
 # This is a simple 20-period SMA of daily volume, matching TradingView's
 # own Volume indicator settings (MA Length: 20, Volume MA: SMA). Every
 # volume-based condition in this app — Vol Multiple, Volume Breakout,
-# Happy Breakout, Early Watchlist — reads from this single function.
+# Happy Breakout, Early Watchlist, Happy Breakout 2.0 — reads from this
+# single function.
 # ================================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -750,8 +830,9 @@ def is_market_open():
 # Final Exit: 15m close is below its plain 21-EMA (on the last CLOSED
 #         candle) — UNCHANGED, no buffer. Fires once, sends a Telegram
 #         alert, and REMOVES the symbol from active_trades entirely — this
-#         is what frees it to fire a brand new Happy Breakout / Early
-#         Watchlist alert later if conditions become true again.
+#         is what frees it to fire a brand new Happy Breakout 2.0 / Happy
+#         Breakout / Early Watchlist alert later if conditions become true
+#         again.
 # There is no forced 15:15 end-of-day close: since the 15-min candle
 # series is a continuous multi-day rolling window, these two conditions
 # simply keep watching the same position into the next trading session.
@@ -2469,36 +2550,55 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Display & Alert Controls")
     show_all_stocks = st.toggle("Show All Stocks (< 1%)", value=False)
+
+    # V6: the new default alert — ON by default (dashboard tab + PC/Telegram).
+    notify_hb2 = st.toggle(
+        f"Enable Happy Breakout 2.0 {HAPPY_BREAKOUT2_EMOJI} (Vol ≥{HB2_VOL_MULTIPLE}x + "
+        f"Volume ≥{format_volume_short(HB2_MIN_VOLUME)} + VO≥100% + 15m DC UB + RSI≥{HB2_RSI_THRESHOLD})",
+        value=True,
+        help=(
+            f"Fires when ALL are true: Vol Multiple ≥ {HB2_VOL_MULTIPLE}x (volume ÷ 20-day Avg Volume), "
+            f"Volume ≥ {HB2_MIN_VOLUME:,}, Daily Volume Oscillator (1,20) ≥ +{HB2_VO_THRESHOLD:.0f}%, "
+            f"15m Donchian (28, offset 6) close ≥ upper channel, Change % vs PrevClose ≥ "
+            f"{PRICE_MOVE_PCT_THRESHOLD}%, 15m RSI(14) ≥ {HB2_RSI_THRESHOLD}, and 15m RSI above its own "
+            f"34-EMA. Priority tier — checked first each cycle. This SAME condition drives the "
+            f"{HAPPY_BREAKOUT2_EMOJI} Happy Breakout 2.0 dashboard tab. Exits are handled by the "
+            f"9/21-EMA exit engine. Every trigger is also listed in the same-day triggered stocks "
+            f"section at the bottom of the page."
+        )
+    )
+
+    # The three older alerts are KEPT but now default to OFF (enable when needed).
     notify_combo = st.toggle(
         f"Enable Happy Breakout {HAPPY_BREAKOUT_EMOJI} ({HAPPY_BREAKOUT_VOL_MULTIPLE}x Avg Vol + "
         f">{format_volume_short(HAPPY_BREAKOUT_MIN_VOLUME)} + RSI>{HAPPY_BREAKOUT_RSI_THRESHOLD} + VO\u2265100%)",
-        value=True,
+        value=False,
         help=(
             f"Price \u2265{PRICE_MOVE_PCT_THRESHOLD}% vs PrevClose, Volume > {HAPPY_BREAKOUT_VOL_MULTIPLE}x 20-day "
             f"Avg Volume AND > {HAPPY_BREAKOUT_MIN_VOLUME:,} shares, 15m Donchian Upper Breakout, "
             f"15m RSI > {HAPPY_BREAKOUT_RSI_THRESHOLD} AND RSI > its own 34-EMA, Daily Volume Oscillator "
-            f"(1,20) \u2265 +100%. Priority tier \u2014 checked before Early Watchlist each cycle. "
+            f"(1,20) \u2265 +100%. Checked after Happy Breakout 2.0 each cycle. "
             f"This SAME condition also drives the \U0001F680 Happy Breakout dashboard tab below — "
             f"the tab and the alert can never disagree. No SL is shown; exits are handled by the "
-            f"9/21-EMA exit engine."
+            f"9/21-EMA exit engine. OFF by default."
         )
     )
     notify_early = st.toggle(
         f"Enable Early Watchlist {EARLY_WATCHLIST_EMOJI} (PDH Break: High \u2265 Prev Day High + "
         f"Vol Multiple > {PDH_VOL_MULTIPLE_THRESHOLD}x + Change \u2265{PRICE_MOVE_PCT_THRESHOLD}%)",
-        value=True,
+        value=False,
         help=(
             f"Mirrors the Google Sheet's \u2018PDH Break\u2019 page: fires when today's High trades at "
             f"or above the previous trading day's High, Volume Multiple (today's volume \u00f7 20-day "
             f"Avg Volume incl. today's live volume) exceeds {PDH_VOL_MULTIPLE_THRESHOLD}x, AND Change % "
             f"vs PrevClose is \u2265{PRICE_MOVE_PCT_THRESHOLD}%. No RSI, no 15m Donchian breakout, and no "
             f"Daily Volume Oscillator requirement \u2014 those still don't gate this tier, independently "
-            f"of Happy Breakout. Only checked if Happy Breakout didn't already fire this cycle for that "
-            f"symbol. No SL is shown; exits are handled by the 9/21-EMA exit engine."
+            f"of Happy Breakout. Only checked if no higher-priority tier already fired this cycle for "
+            f"that symbol. No SL is shown; exits are handled by the 9/21-EMA exit engine. OFF by default."
         )
     )
     notify_vol = st.toggle("Enable Individual Volume Alerts", value=False)
-    notify_dc = st.toggle("Enable Individual Donchian Alerts", value=True)
+    notify_dc = st.toggle("Enable Individual Donchian Alerts (HAPPY SF)", value=False)
     notify_gap_filter = st.toggle(
         f"Enable Gap-Up Filter 🛡️ (Open ≥ {GAP_UP_PCT_THRESHOLD}% above Prev Close → wait for 9:45 High break)",
         value=True,
@@ -2531,10 +2631,11 @@ with st.sidebar:
         value=False,
         help=(
             "Removes the symbol from Active Managed Trades entirely, freeing it to fire a brand-new "
-            "Happy Breakout / Early Watchlist alert later if conditions become true again. Logic is "
-            "unchanged — plain close below the 21-EMA on the last closed 15m candle, no ATR buffer. "
-            "Turn this off to stop positions from being auto-closed — they simply stay listed under "
-            "Active Managed Trades until you turn this back on or reset the log manually."
+            "Happy Breakout 2.0 / Happy Breakout / Early Watchlist alert later if conditions become "
+            "true again. Logic is unchanged — plain close below the 21-EMA on the last closed 15m "
+            "candle, no ATR buffer. Turn this off to stop positions from being auto-closed — they "
+            "simply stay listed under Active Managed Trades until you turn this back on or reset the "
+            "log manually."
         )
     )
     notify_book_profit = st.toggle(
@@ -2663,8 +2764,8 @@ if 'access_token' in st.session_state:
     # forming volume) — the same basis TradingView's Volume indicator uses
     # (MA Length 20, Volume MA: SMA). The old, separate 22-completed-day
     # average has been removed so every volume condition in this app (Vol
-    # Multiple, Volume Breakout, Happy Breakout, Early Watchlist) reads
-    # from this one single number.
+    # Multiple, Volume Breakout, Happy Breakout, Early Watchlist, Happy
+    # Breakout 2.0) reads from this one single number.
     avg_vols_20 = get_daily_avg_vol_20(st.session_state.access_token, API_KEY, symbols)
     results = []
 
@@ -2724,7 +2825,7 @@ if 'access_token' in st.session_state:
             should_evaluate = show_all_stocks or pct >= 1.0 or is_vol_break_100k or is_vol_multiple_high or is_happy_sf_vol_ok
 
             rsi_15m_val = 0.0
-            rsi_15m_ema34 = 0.0  # used only by the Happy Breakout alert condition below
+            rsi_15m_ema34 = 0.0  # used only by the Happy Breakout / Happy Breakout 2.0 alert conditions below
 
             if should_evaluate:
                 df_15m, df_1h, df_day, df_week = fetch_multi_timeframe_candles(st.session_state.access_token, API_KEY, q['instrument_token'])
@@ -2739,8 +2840,9 @@ if 'access_token' in st.session_state:
                 )
 
                 # Independent RSI/EMA34 read, used only for the Happy Breakout
-                # alert condition — kept separate from the Score/tooltip logic
-                # above so the dashboard table's Score column is untouched.
+                # / Happy Breakout 2.0 alert conditions — kept separate from the
+                # Score/tooltip logic above so the dashboard table's Score column
+                # is untouched.
                 if df_15m is not None and len(df_15m) >= 34:
                     _, rsi_15m_ema34 = calculate_rsi_and_ema(df_15m['close'])
                 else:
@@ -2778,10 +2880,26 @@ if 'access_token' in st.session_state:
             tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_short}"
 
             # ============================================================
-            # Early Watchlist / Happy Breakout conditions
+            # Happy Breakout 2.0 / Early Watchlist / Happy Breakout conditions
             # ============================================================
             vo_ok = vol_osc_pct is not None and pd.notna(vol_osc_pct) and vol_osc_pct >= DAILY_VO_THRESHOLD
             rsi_above_own_ema = rsi_15m_val > rsi_15m_ema34
+
+            # V6: HAPPY BREAKOUT 2.0 — the single new default alert. ALL true:
+            #  (1) Vol Multiple >= 1.1x          (2) Volume >= 150,000
+            #  (3) Daily VO (1,20) >= +100%      (4) 15m Donchian (28, 6) close >= upper
+            #  (5) Change % vs PrevClose >= 1%   (6) 15m RSI(14) >= 60
+            #  (7) 15m RSI above its own 34-EMA
+            is_happy_breakout2 = (
+                avg_v_20 > 0 and avg_v_20 < 999999999
+                and vol_multiple >= HB2_VOL_MULTIPLE
+                and vol >= HB2_MIN_VOLUME
+                and vo_ok
+                and is_dc_breakout
+                and pct >= PRICE_MOVE_PCT_THRESHOLD
+                and rsi_15m_val >= HB2_RSI_THRESHOLD
+                and rsi_above_own_ema
+            )
 
             is_happy_breakout = (
                 avg_v_20 > 0 and avg_v_20 < 999999999
@@ -2814,9 +2932,10 @@ if 'access_token' in st.session_state:
             )
 
             # Persistent, exit-gated dedup: a tier only fires once per
-            # lifecycle. A symbol stays "in play" (both tiers unlockable
+            # lifecycle. A symbol stays "in play" (all tiers unlockable
             # again) only after Final Exit removes it entirely.
             existing_trade = active_trades_snapshot.get(sym_short)
+            already_alerted_happy2 = bool(existing_trade and existing_trade.get("alerted_happy2"))
             already_alerted_happy = bool(existing_trade and existing_trade.get("alerted_happy"))
             already_alerted_early = bool(existing_trade and existing_trade.get("alerted_early"))
 
@@ -2837,7 +2956,9 @@ if 'access_token' in st.session_state:
 
             alert_type = ""
             if market_active and not gap_blocked:
-                if notify_combo and is_happy_breakout and not already_alerted_happy:
+                if notify_hb2 and is_happy_breakout2 and not already_alerted_happy2:
+                    alert_type = "Happy Breakout 2.0"
+                elif notify_combo and is_happy_breakout and not already_alerted_happy:
                     alert_type = "Happy Breakout"
                 elif notify_early and is_early_watchlist and not already_alerted_early:
                     alert_type = "Early Watchlist Alert"
@@ -2848,8 +2969,13 @@ if 'access_token' in st.session_state:
                      and f"{sym_short}|HAPPY SF" not in alerted_keys):
                      alert_type = "HAPPY SF"
 
-            if alert_type in ("Happy Breakout", "Early Watchlist Alert"):
-                score_emoji = HAPPY_BREAKOUT_EMOJI if alert_type == "Happy Breakout" else EARLY_WATCHLIST_EMOJI
+            if alert_type in ("Happy Breakout 2.0", "Happy Breakout", "Early Watchlist Alert"):
+                if alert_type == "Happy Breakout 2.0":
+                    score_emoji = HAPPY_BREAKOUT2_EMOJI
+                elif alert_type == "Happy Breakout":
+                    score_emoji = HAPPY_BREAKOUT_EMOJI
+                else:
+                    score_emoji = EARLY_WATCHLIST_EMOJI
 
                 active_trades = load_active_trades()
                 prior = active_trades.get(sym_short, {})
@@ -2859,6 +2985,7 @@ if 'access_token' in st.session_state:
                     "trigger_time": prior.get("trigger_time", datetime.now(IST).isoformat()),
                     "alerted_early": prior.get("alerted_early", False) or (alert_type == "Early Watchlist Alert"),
                     "alerted_happy": prior.get("alerted_happy", False) or (alert_type == "Happy Breakout"),
+                    "alerted_happy2": prior.get("alerted_happy2", False) or (alert_type == "Happy Breakout 2.0"),
                     "exit1_triggered": prior.get("exit1_triggered", False),
                     "book_profit_triggered": prior.get("book_profit_triggered", False),
                     "final_exit_triggered": False
@@ -2875,6 +3002,8 @@ if 'access_token' in st.session_state:
                     "LTP": ltp,
                     "Chart": tv_url
                 })
+                # V6: same-day triggered stocks list (persisted)
+                log_todays_trigger(sym_short, alert_type, score_emoji, ltp, chart_url=tv_url)
 
             elif alert_type:
                 # Old Volume Breakout / Donchian Upper 15m toggles —
@@ -2889,6 +3018,8 @@ if 'access_token' in st.session_state:
                     "LTP": ltp,
                     "Chart": tv_url
                 })
+                # V6: same-day triggered stocks list (persisted)
+                log_todays_trigger(sym_short, alert_type, star_score_plain, ltp, chart_url=tv_url)
 
             results.append({
                 "Symbol": sym_short,
@@ -2916,7 +3047,11 @@ if 'access_token' in st.session_state:
                 # (the SAME boolean used for Telegram/PC alerts), used to power the
                 # Happy Breakout dashboard tab below — this tab and the alert can no
                 # longer disagree, since both read from this one boolean.
-                "_is_happy_breakout": is_happy_breakout
+                "_is_happy_breakout": is_happy_breakout,
+                # V6: the actual current Happy Breakout 2.0 alert condition for this row
+                # (the SAME boolean used for Telegram/PC alerts), used to power the
+                # Happy Breakout 2.0 dashboard tab below.
+                "_is_happy_breakout2": is_happy_breakout2
             })
         except Exception:
             continue
@@ -2963,6 +3098,12 @@ if 'access_token' in st.session_state:
         else:
             df_display['vol_numeric'] = 0.0
 
+        # V6: Happy Breakout 2.0 tab — filtered on the exact same boolean used
+        # for the Telegram/PC Happy Breakout 2.0 alerts (Vol Multiple >=1.1x +
+        # Volume >=150k + Daily VO >=100% + 15m Donchian Upper Breakout +
+        # Change % >=1% + 15m RSI >=60 + RSI above its own EMA34).
+        df_hb2 = df_display[df_display['_is_happy_breakout2'] == True].copy()
+
         # V2: Happy Breakout tab — filtered on the exact same boolean used
         # for the Telegram/PC Happy Breakout alerts (Vol Multiple >2.5x +
         # Volume >500k + Change % >=1% + 15m Donchian Upper Breakout + 15m
@@ -2981,9 +3122,10 @@ if 'access_token' in st.session_state:
         df_early = df_display[df_display['_is_early_watchlist'] == True].copy()
 
         # Clean temporary/hidden helper columns before anything gets displayed
-        for df_item in [df_display, df_combo, df_early]:
-            df_item.drop(columns=['vol_numeric', '_vol_multiple_raw', '_rsi_15m', '_is_early_watchlist', '_is_happy_breakout'], inplace=True, errors='ignore')
+        for df_item in [df_display, df_hb2, df_combo, df_early]:
+            df_item.drop(columns=['vol_numeric', '_vol_multiple_raw', '_rsi_15m', '_is_early_watchlist', '_is_happy_breakout', '_is_happy_breakout2'], inplace=True, errors='ignore')
 
+        hb2_count = len(df_hb2)
         combo_count = len(df_combo)
         early_count = len(df_early)
         vol_count = len(df_display[df_display['Daily VO %'] > 0]) if 'Daily VO %' in df_display.columns else 0
@@ -3002,7 +3144,8 @@ if 'access_token' in st.session_state:
             horizontal=True
         )
 
-        t_combo, t_early, t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
+        t_hb2, t_combo, t_early, t_main, t_vol, t_dc, t_gsheet_log, t_log = st.tabs([
+            f"{HAPPY_BREAKOUT2_EMOJI} Happy Breakout 2.0 ({hb2_count})",
             f"🚀 Happy Breakout ({combo_count})",
             f"🚩 Early Watchlist ({early_count})",
             f"📊 Market ({len(df_display)})",
@@ -3076,6 +3219,10 @@ if 'access_token' in st.session_state:
                 render_dataframe_mode(df_data)
 
         # --- TAB CONTENT RENDERING ---
+        with t_hb2:
+            st.subheader(f"{HAPPY_BREAKOUT2_EMOJI} Happy Breakout 2.0 Candidates")
+            display_data(df_hb2)
+
         with t_combo:
             st.subheader("🚀 Happy Breakout Candidates")
             display_data(df_combo)
@@ -3142,6 +3289,8 @@ if 'access_token' in st.session_state:
             active_rows = []
             for sym, tdata in active_trades.items():
                 tier_label = []
+                if tdata.get("alerted_happy2"):
+                    tier_label.append(HAPPY_BREAKOUT2_EMOJI)
                 if tdata.get("alerted_happy"):
                     tier_label.append(HAPPY_BREAKOUT_EMOJI)
                 if tdata.get("alerted_early"):
@@ -3211,8 +3360,11 @@ if 'access_token' in st.session_state:
             if "DC 15m" in df_display.columns else []
         )
 
+        _today_entries = load_todays_triggers().get("entries", [])
+
         chart_groups = {
             "All scanner symbols": chart_symbols,
+            f"{HAPPY_BREAKOUT2_EMOJI} Happy Breakout 2.0": _uniq(df_hb2["Symbol"].tolist()),
             "🚀 Happy Breakout": _uniq(df_combo["Symbol"].tolist()),
             "🚩 Early Watchlist": _uniq(df_early["Symbol"].tolist()),
             "📊 Market (filtered)": _uniq(df_display["Symbol"].tolist()),
@@ -3220,12 +3372,63 @@ if 'access_token' in st.session_state:
             "📈 Donchian 15m": _dc_syms,
             "📋 GSheet Alert_Log": _gs_syms,
             "🎯 Active Trades": _uniq(list(_active_now.keys())),
+            "📅 Today's Triggered": _uniq([e.get("Symbol", "") for e in _today_entries]),
         }
 
         render_live_chart_section(
             st.session_state.kite, chart_symbols, token_lookup, market_active,
             groups=chart_groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup
         )
+
+        # --- V6: SAME-DAY TRIGGERED STOCKS LIST (bottom of the page) ---
+        # Every stock that fired a PC/Telegram entry alert TODAY (IST), any tier.
+        # Persisted in todays_triggers.json, resets automatically each new day.
+        st.divider()
+        _td = load_todays_triggers()
+        _entries = _td.get("entries", [])
+        st.header(f"📅 Today's Triggered Stocks ({len(_entries)}) — {_td.get('date', '')}")
+
+        if _entries:
+            _rows = []
+            for e in _entries:
+                _sym = e.get("Symbol", "")
+                _q = full_quotes.get(f"NSE:{_sym}")
+                _cur = float(_q["last_price"]) if _q and _q.get("last_price") else None
+                _trig = float(e.get("Trigger LTP", 0) or 0)
+                _since = round(((_cur - _trig) / _trig) * 100.0, 2) if (_cur is not None and _trig > 0) else None
+                _cl = float((_q.get("ohlc") or {}).get("close", 0) or 0) if _q else 0.0
+                _chg = round(((_cur - _cl) / _cl) * 100.0, 2) if (_cur is not None and _cl > 0) else None
+                _rows.append({
+                    "Time": e.get("Time", ""),
+                    "Symbol": _sym,
+                    "Type": e.get("Type", ""),
+                    "Score": e.get("Score", ""),
+                    "Trigger LTP": _trig,
+                    "Current LTP": _cur,
+                    "Since Trigger %": _since,
+                    "Change %": _chg,
+                    "Chart": e.get("Chart") or f"https://www.tradingview.com/chart/?symbol=NSE:{_sym}"
+                })
+
+            df_today = pd.DataFrame(_rows).iloc[::-1].reset_index(drop=True)  # latest trigger first
+            st.dataframe(
+                df_today,
+                column_config={
+                    "Trigger LTP": st.column_config.NumberColumn("Trigger LTP", format="₹%.2f"),
+                    "Current LTP": st.column_config.NumberColumn("Current LTP", format="₹%.2f"),
+                    "Since Trigger %": st.column_config.NumberColumn("Since Trigger %", format="%.2f%%"),
+                    "Change %": st.column_config.NumberColumn("Change %", format="%.2f%%"),
+                    "Chart": st.column_config.LinkColumn("Chart", display_text="Open TV ↗")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            if st.button("Clear Today's Triggered List", type="secondary"):
+                _write_todays_triggers({"date": _td.get("date", ""), "entries": []})
+                st.session_state["todays_triggers"] = {"date": _td.get("date", ""), "entries": []}
+                st.rerun()
+        else:
+            st.info("No stocks have triggered an alert today yet.")
 
 else:
     st.info("Click 'Activate Session' or adjust sidebar filters to display market data.")
