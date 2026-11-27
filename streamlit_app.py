@@ -27,6 +27,40 @@ except Exception:
 st.set_page_config(page_title="Master Omni-Scanner Pro", layout="wide")
 IST = pytz.timezone('Asia/Kolkata')
 
+# ================================================================
+# V7 — WHAT CHANGED (everything else is exactly as before)
+# ================================================================
+#  1) VIEW LIVE CHART now mirrors the Google Sheet's updated chart (Master Key V52.x):
+#       - bigger candles by default (12 px per bar instead of the library's 6);
+#       - 💾 Save now keeps the LAYOUT as well as the indicators (candle size / position and whether the
+#         Indicators panel is open) in this browser; candle size is also remembered automatically when you zoom;
+#       - the RSI EMA tag on the RSI pane shows its value (like the RSI tag);
+#       - Daily VO (1,20) is shown in the Volume / Avg Vol / Vol M row (green at 50% or more, red below 0).
+#  2) TELEGRAM NOTIFICATIONS ARE OFF BY DEFAULT. One master switch in the sidebar ("📨 Telegram notifications")
+#     starts OFF in every new browser session; while it is off NOTHING is sent to Telegram (dashboard tabs, toasts and
+#     the same-day triggered list keep working). Change TELEGRAM_DEFAULT_ON below to True to restore the old behaviour.
+#     (The Google Sheet / Apps Script keeps sending its own Telegram alerts from Google's servers.)
+#  3) STABLE SCREEN / CHART options (sidebar -> "🖥 Screen & Chart Stability"):
+#       - Dashboard auto-refresh: every 60 s (as before) / 2 min / 5 min / PAUSED (stable chart).
+#         The 60-second full-page refresh rebuilds the whole page (quotes, tables, chart) and is what made the chart
+#         flicker / reset; "Paused" removes it and the chart then refreshes ONLY itself (its own Auto-refresh).
+#       - The whole chart block is now a separate "fragment": changing the symbol / timeframe / height / refresh
+#         re-runs only the chart (a few Kite calls) and NOT the full scanner.
+#       - 🔄 Refresh dashboard now (button) and 🔄 Refresh chart now (button above the chart).
+#       - Chart position: bottom of the page (as before) or TOP of the page.
+#     Defaults for these are the constants right below (DEFAULT_SCREEN_MODE, DEFAULT_CHART_POSITION).
+# ================================================================
+TELEGRAM_DEFAULT_ON = False          # V7: Telegram master switch starts OFF (set True to restore the old behaviour)
+SCREEN_MODES = {                      # dashboard auto-refresh choices -> milliseconds (0 = paused)
+    "Every 60 s (as before)": 60000,
+    "Every 2 min": 120000,
+    "Every 5 min": 300000,
+    "Paused (stable chart)": 0,
+}
+DEFAULT_SCREEN_MODE = "Every 60 s (as before)"
+CHART_POSITIONS = ["Bottom of page (as before)", "Top of page"]
+DEFAULT_CHART_POSITION = "Bottom of page (as before)"
+
 # --- MARKET HOURS AUTO-REFRESH CONTROL ---
 
 now_ist = datetime.now(IST)
@@ -35,8 +69,11 @@ market_start = dtime(9, 7)
 market_end = dtime(15, 30)
 is_weekday = now_ist.weekday() < 5  # Monday to Friday
 
-if is_weekday and (market_start <= current_time <= market_end):
-    st_autorefresh(interval=60000, key="omni_scanner_autorefresh")
+# V7: the interval comes from the sidebar "Dashboard auto-refresh" choice (value kept from the previous run);
+# 0 = paused, so the page (and the chart in it) is not rebuilt every minute.
+_dash_interval = SCREEN_MODES.get(st.session_state.get("screen_mode", DEFAULT_SCREEN_MODE), 60000)
+if is_weekday and (market_start <= current_time <= market_end) and _dash_interval > 0:
+    st_autorefresh(interval=_dash_interval, key=f"omni_scanner_autorefresh_{_dash_interval}")
 
 st.markdown("""
 <style>
@@ -520,6 +557,10 @@ def calculate_5star_score(df_15m, df_1h, df_day, df_week, vol_osc_pct=None, vol_
 # --- 2. PC & TELEGRAM NOTIFICATION ENGINE ---
 
 def send_telegram_raw(message):
+    # V7: master switch (sidebar "📨 Telegram notifications"), OFF by default. Every Telegram message of this app
+    # (entry, exit, book-profit) goes through this one function, so nothing is sent while the switch is off.
+    if not st.session_state.get("tg_enabled", TELEGRAM_DEFAULT_ON):
+        return
     try:
         bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
@@ -1103,6 +1144,8 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
   button.on { background: #2962ff; border-color: #2962ff; color: #fff; }
   button.dirty { background: #ff9800; border-color: #ff9800; color: #000; }
   #stats { padding: 4px 12px; background: var(--bar); border-bottom: 1px solid var(--bd); font-size: 12px; color: var(--mut); }
+  #stats b.up { color: #26a69a; }
+  #stats b.down { color: #ef5350; }
   #stats b { color: var(--txt); }
   #hdr { display: flex; flex-wrap: wrap; gap: 14px; align-items: baseline; padding: 4px 12px; }
   #sym { font-size: 17px; font-weight: bold; }
@@ -1139,7 +1182,7 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
 <body>
 <div id="bar">
   <button id="indbtn">Indicators</button>
-  <button id="savebtn" title="Save indicator + chart settings in this browser">💾 Save</button>
+  <button id="savebtn" title="Save indicator settings + chart layout (candle size, Indicators panel) in this browser">💾 Save</button>
   <button id="themebtn">☀ Light</button>
   <button id="fsbtn" title="Full screen">⛶ Full screen</button>
   <span id="info" style="color:var(--mut)"></span>
@@ -1181,6 +1224,7 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
   var CT = null, pane2 = { kind: null, series: [], lines: [] }, syncing = false, applyTimer = null;
   var modErrs = [], noTrack = true, ovErr = '', dirty = false, snapSaved = '', viewTimer = null, openIds = {};
   var memStore = {};
+  var DEFAULT_SPACING = 12;     // V7: default candle size in px per bar (library default is 6): bigger candles on first open
 
   function $(id) { return document.getElementById(id); }
   function cmp(a, b) { return a < b ? -1 : (a > b ? 1 : 0); }
@@ -1396,8 +1440,18 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
     snapSaved = JSON.stringify(S);
     stSet('l', 'lc5_saved', snapSaved);
     stSet('s', 'lc5_work', snapSaved);
+    // V7: the LAYOUT is saved too — candle size / position exactly as on screen now, and whether the Indicators panel is open
+    try {
+      var ts = chart.timeScale(), r = ts.getVisibleLogicalRange(), wd = ts.width();
+      if (r && r.to > r.from && wd > 0) {
+        state.spacing = wd / (r.to - r.from);
+        state.gap = r.to - (state.candles.length - 1);
+      }
+    } catch (e) {}
+    stSet('l', 'lc5_view', JSON.stringify({ spacing: state.spacing, gap: state.gap }));
+    stSet('l', 'lc5_panel_saved', $('panel').style.display === 'block' ? '1' : '0');
     refreshDirty();
-    setStatus('Settings saved in this browser. They load automatically every time.', 'live');
+    setStatus('Settings + layout saved in this browser. They load automatically every time.', 'live');
   }
 
   function scheduleApply() { clearTimeout(applyTimer); applyTimer = setTimeout(function () { applyAll(null); }, 120); }
@@ -2224,7 +2278,7 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
       pane2.series = []; pane2.lines = [];
       if (kind === 'rsi') {
         var rs = chart2.addLineSeries({ title: 'RSI', priceLineVisible: false, autoscaleInfoProvider: function () { return { priceRange: { minValue: 0, maxValue: 100 } }; } });
-        var re = chart2.addLineSeries({ title: 'RSI EMA', priceLineVisible: false, lastValueVisible: false });
+        var re = chart2.addLineSeries({ title: 'RSI EMA', priceLineVisible: false, lastValueVisible: true });   // V7: tag shows the value
         [70, 50, 30].forEach(function (p) { pane2.lines.push(rs.createPriceLine({ price: p, color: '#555a66', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })); });
         pane2.series = [rs, re];
       } else {
@@ -2338,7 +2392,13 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
   function renderStats() {
     var s = DATA.stats, el = $('stats');
     if (!s) { el.textContent = 'Scanner data: not available for this symbol.'; return; }
-    el.innerHTML = 'Scanner data (' + esc(s.src) + '):&nbsp; Volume <b>' + esc(s.volume) + '</b> &nbsp;|&nbsp; Avg Vol <b>' + esc(s.avgVol) + '</b> &nbsp;|&nbsp; Vol M <b>' + esc(s.volM) + '</b>';
+    var voHtml = '';
+    if (s.vo !== undefined && s.vo !== null && s.vo !== '') {     // V7: Daily Volume Oscillator (green at 50% or more, red below 0)
+      var vn = parseFloat(String(s.vo).split('%').join('').split(',').join(''));
+      var cls = isNaN(vn) ? '' : (vn >= 50 ? 'up' : (vn < 0 ? 'down' : ''));
+      voHtml = ' &nbsp;|&nbsp; Daily VO <b' + (cls ? ' class="' + cls + '"' : '') + '>' + esc(s.vo) + '</b>';
+    }
+    el.innerHTML = 'Scanner data (' + esc(s.src) + '):&nbsp; Volume <b>' + esc(s.volume) + '</b> &nbsp;|&nbsp; Avg Vol <b>' + esc(s.avgVol) + '</b> &nbsp;|&nbsp; Vol M <b>' + esc(s.volM) + '</b>' + voHtml;
   }
   function showRange() {
     var n = state.candles.length, ts = chart.timeScale();
@@ -2348,8 +2408,9 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
       if (state.spacing > 0) {          // keep the candle size / position the user chose
         ts.applyOptions({ barSpacing: state.spacing });
         ts.scrollToPosition(state.gap !== null ? state.gap : S.chart.rightOff, false);
-      } else {
-        ts.setVisibleLogicalRange({ from: Math.max(0, n - bars), to: n + S.chart.rightOff });
+      } else {                          // V7: larger candles by default (was: fit ~140 bars across the width)
+        ts.applyOptions({ barSpacing: DEFAULT_SPACING });
+        ts.scrollToPosition(S.chart.rightOff, false);
       }
     } catch (e) {}
     setTimeout(function () { noTrack = false; }, 700);
@@ -2381,7 +2442,9 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
     $('info').textContent = DATA.symbol + ' · ' + DATA.tf + (DATA.refresh > 0 ? ' · auto-refresh ' + DATA.refresh + ' s' : ' · auto-refresh off');
 
     var panel = $('panel');
-    if (stGet('s', 'lc5_panel') === '1') { panel.style.display = 'block'; $('indbtn').className = 'on'; }
+    var panelPref = stGet('s', 'lc5_panel');                 // this tab's current choice, else the one saved with 💾 Save
+    if (panelPref === null) panelPref = stGet('l', 'lc5_panel_saved');
+    if (panelPref === '1') { panel.style.display = 'block'; $('indbtn').className = 'on'; }
     buildPanel();
     var ps = Number(stGet('s', 'lc5_pscroll') || 0);
     if (ps > 0) panel.scrollTop = ps;
@@ -2428,6 +2491,26 @@ def build_live_chart_html(payload):
     return LIVE_CHART_HTML.replace("__DATA__", json.dumps(payload).replace("</", "<\\/"))
 
 
+def _chart_daily_vo(daily_rows, live_volume):
+    """V7: Daily Volume Oscillator (1,20) for the chart's stats row — the SAME calculate_volume_oscillator() the
+    dashboard uses, on the daily candles with today's volume replaced by the live quote volume. None if unknown."""
+    try:
+        vols = [float(r[5] or 0) for r in daily_rows]
+        if not vols:
+            return None
+        now = datetime.now(IST)
+        if live_volume is not None:
+            if str(daily_rows[-1][0])[:10] == now.strftime("%Y-%m-%d"):
+                vols[-1] = float(live_volume)
+            elif now.weekday() < 5 and now.time() >= dtime(9, 7):
+                vols.append(float(live_volume))            # today's candle is not in the cached daily list yet
+        if len(vols) < 20:
+            return None
+        return calculate_volume_oscillator(pd.DataFrame({"volume": vols}), short_len=1, long_len=20)
+    except Exception:
+        return None
+
+
 def draw_live_chart(kite_inst, symbol, instrument_token, prev_close, avg_vol, tf_label, height,
                     refresh_secs, market_is_active, stats_source="Kite live"):
     interval, days = LIVE_CHART_TIMEFRAMES[tf_label]
@@ -2460,6 +2543,9 @@ def draw_live_chart(kite_inst, symbol, instrument_token, prev_close, avg_vol, tf
             "volM": format_volume_multiple(vol_live / avg_vol) if avg_ok else "N/A",
             "src": stats_source,
         }
+        _vo = _chart_daily_vo(htf, vol_live)       # V7: Daily VO (1,20) in the same row
+        if _vo is not None:
+            stats["vo"] = f"{_vo:.2f}%"
 
     payload = {
         "symbol": symbol,
@@ -2489,49 +2575,64 @@ def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is
     prev_close_lookup = prev_close_lookup or {}
     avg_vol_lookup = avg_vol_lookup or {}
 
-    r1a, r1b, r1c = st.columns([2, 3, 2])
-    src = r1a.selectbox("Page / list", list(groups), key="livechart_src")
-    picked = r1b.selectbox("Symbol", groups[src], key=f"livechart_sym_{src}")
-    typed = r1c.text_input("Or type any NSE symbol", key="livechart_typed",
-                           help="Leave empty to use the symbol picked on the left.").strip().upper()
-    symbol = typed if (typed and _re.fullmatch(r"[A-Z0-9&_.\- ]{1,30}", typed)) else picked
+    # V7: the WHOLE chart block (pickers + chart) is one fragment, so changing the symbol / timeframe / height /
+    # refresh re-runs only this block (a few Kite calls) instead of the full scanner, and its own timer (run_every)
+    # refreshes only the chart. run_every is fixed when the fragment is created, so when the Auto-refresh choice
+    # changes, one full rerun applies it (applied_refresh below is the value the fragment was created with).
+    default_refresh = 15 if market_is_active else 0
+    applied_refresh = st.session_state.get("livechart_refresh", default_refresh)
+    if applied_refresh not in LIVE_CHART_REFRESH_OPTIONS:
+        applied_refresh = default_refresh
 
-    r2a, r2b, r2c = st.columns([4, 2, 2])
-    tf_label = r2a.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True, key="livechart_tf")
-    height = r2b.slider("Height", 450, 1000, 700, 50, key="livechart_h")
-    refresh_secs = r2c.selectbox(
-        "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
-        index=LIVE_CHART_REFRESH_OPTIONS.index(15) if market_is_active else 0,
-        format_func=lambda x: "Off" if x == 0 else f"{x} s", key="livechart_refresh",
-        help="Re-pulls the forming candle from Kite. Only the chart reruns, not the whole scanner. "
-             "Set it to Off while you are changing indicator settings."
-    )
+    def _section():
+        r1a, r1b, r1c = st.columns([2, 3, 2])
+        src = r1a.selectbox("Page / list", list(groups), key="livechart_src")
+        picked = r1b.selectbox("Symbol", groups[src], key=f"livechart_sym_{src}")
+        typed = r1c.text_input("Or type any NSE symbol", key="livechart_typed",
+                               help="Leave empty to use the symbol picked on the left.").strip().upper()
+        symbol = typed if (typed and _re.fullmatch(r"[A-Z0-9&_.\- ]{1,30}", typed)) else picked
 
-    token = token_lookup.get(symbol)
-    prev_close = prev_close_lookup.get(symbol, 0.0)
-    if not token:
-        info = fetch_live_chart_symbol_info(st.session_state.access_token, API_KEY, symbol)
-        if info:
-            token = info["token"]
-            prev_close = prev_close or info["prevClose"]
-    if not token:
-        st.warning(f"Instrument token not found for {symbol}.")
-        return
+        r2a, r2b, r2c, r2d = st.columns([4, 2, 2, 2])
+        tf_label = r2a.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True, key="livechart_tf")
+        height = r2b.slider("Height", 450, 1000, 700, 50, key="livechart_h")
+        refresh_secs = r2c.selectbox(
+            "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
+            index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
+            format_func=lambda x: "Off" if x == 0 else f"{x} s", key="livechart_refresh",
+            help="Re-pulls the forming candle from Kite. Only the chart reruns, not the whole scanner. "
+                 "Set it to Off while you are changing indicator settings, then use 🔄 Refresh chart now."
+        )
+        r2d.write("")
+        r2d.button("🔄 Refresh chart now", key="livechart_refresh_now", use_container_width=True)
 
-    avg_vol = avg_vol_lookup.get(symbol, 0)
-    src_label = "Kite live" if symbol in avg_vol_lookup else "Kite live, no 20D avg for this symbol"
+        if hasattr(st, "fragment") and refresh_secs != applied_refresh:
+            st.rerun()          # full rerun, so the new auto-refresh interval takes effect
 
-    def _draw():
+        token = token_lookup.get(symbol)
+        prev_close = prev_close_lookup.get(symbol, 0.0)
+        if not token:
+            info = fetch_live_chart_symbol_info(st.session_state.access_token, API_KEY, symbol)
+            if info:
+                token = info["token"]
+                prev_close = prev_close or info["prevClose"]
+        if not token:
+            st.warning(f"Instrument token not found for {symbol}.")
+            return
+
+        avg_vol = avg_vol_lookup.get(symbol, 0)
+        src_label = "Kite live" if symbol in avg_vol_lookup else "Kite live, no 20D avg for this symbol"
+
         draw_live_chart(kite_inst, symbol, token, prev_close, avg_vol, tf_label, height,
                         refresh_secs, market_is_active, src_label)
 
-    if refresh_secs and hasattr(st, "fragment"):
-        st.fragment(run_every=refresh_secs)(_draw)()
-    else:
-        _draw()
+        st.caption("Indicator settings are stored in this browser: changes are kept while you work, "
+                   "press 💾 Save inside the chart to keep them (and the candle size / Indicators panel) for good. "
+                   "Full screen: ⛶ button inside the chart.")
 
-    st.caption("Indicator settings are stored in this browser: changes are kept while you work, "
-               "press 💾 Save inside the chart to keep them for good. Full screen: ⛶ button inside the chart.")
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=(applied_refresh or None))(_section)()
+    else:
+        _section()
 
 
 # --- 6. SIDEBAR ---
@@ -2548,7 +2649,34 @@ with st.sidebar:
         st.warning("Market Status: CLOSED (Manual Mode / Backtest) 🔴")
 
     st.divider()
+    st.header("🖥 Screen & Chart Stability")
+    st.radio(
+        "Dashboard auto-refresh", list(SCREEN_MODES), index=list(SCREEN_MODES).index(DEFAULT_SCREEN_MODE),
+        key="screen_mode",
+        help="How often the WHOLE page (quotes, tables and chart) is rebuilt during market hours. Every rebuild can "
+             "make the chart flicker or reset. Choose 'Paused (stable chart)' while you are working on a chart: the "
+             "chart keeps refreshing itself (its own Auto-refresh) and the tables stay as they were until you press "
+             "🔄 Refresh dashboard now."
+    )
+    st.button("🔄 Refresh dashboard now", use_container_width=True)
+    st.radio(
+        "Chart position", CHART_POSITIONS, index=CHART_POSITIONS.index(DEFAULT_CHART_POSITION),
+        key="chart_position",
+        help="'Top of page' puts View Live Chart above the tables, so it stays in view and does not move when the "
+             "tables below it change size."
+    )
+    if st.session_state.get("screen_mode", DEFAULT_SCREEN_MODE) == "Paused (stable chart)":
+        st.caption("Dashboard paused: tables are as of the last refresh. The chart updates itself.")
+
+    st.divider()
     st.header("⚙️ Display & Alert Controls")
+    tg_master = st.toggle(
+        "📨 Telegram notifications (master switch)", value=TELEGRAM_DEFAULT_ON, key="tg_enabled",
+        help="OFF by default in every new browser session. While OFF nothing is sent to Telegram from this app "
+             "(alerts still show in the dashboard tabs, toasts and the same-day triggered list). The Google Sheet "
+             "keeps sending its own Telegram alerts. Turn ON only if you want this app to send them too."
+    )
+    st.caption("Telegram from this app: ON ✅" if tg_master else "Telegram from this app: OFF 🔕 (default)")
     show_all_stocks = st.toggle("Show All Stocks (< 1%)", value=False)
 
     # V6: the new default alert — ON by default (dashboard tab + PC/Telegram).
@@ -3132,6 +3260,9 @@ if 'access_token' in st.session_state:
         dc_count = len(df_display[df_display['DC 15m'].astype(str).str.contains("🚀", na=False)]) if 'DC 15m' in df_display.columns else 0
         history_count = len(st.session_state.alerts_history)
 
+        # V7: when "Chart position = Top of page" the chart is drawn into this slot (filled at the end of the run).
+        chart_slot = st.container()
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Sheet Symbols", f"{total_fetched_count}")
         c2.metric("Active Filtered Stocks", f"{len(df_display)}")
@@ -3375,10 +3506,17 @@ if 'access_token' in st.session_state:
             "📅 Today's Triggered": _uniq([e.get("Symbol", "") for e in _today_entries]),
         }
 
-        render_live_chart_section(
-            st.session_state.kite, chart_symbols, token_lookup, market_active,
-            groups=chart_groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup
-        )
+        if st.session_state.get("chart_position", DEFAULT_CHART_POSITION) == "Top of page":
+            with chart_slot:
+                render_live_chart_section(
+                    st.session_state.kite, chart_symbols, token_lookup, market_active,
+                    groups=chart_groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup
+                )
+        else:
+            render_live_chart_section(
+                st.session_state.kite, chart_symbols, token_lookup, market_active,
+                groups=chart_groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup
+            )
 
         # --- V6: SAME-DAY TRIGGERED STOCKS LIST (bottom of the page) ---
         # Every stock that fired a PC/Telegram entry alert TODAY (IST), any tier.
