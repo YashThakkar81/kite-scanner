@@ -63,6 +63,12 @@ IST = pytz.timezone('Asia/Kolkata')
 #   - In the two-chart layouts the auto-refresh defaults to 30 s per chart (each chart makes its own Kite calls).
 #   - The scanner, alerts, Telegram (off by default) and all tables are untouched. Defaults: DEFAULT_CHART_LAYOUT below.
 # ================================================================
+# V9 — FOCUS MODE (everything else is exactly as V8): sidebar toggle "🎯 Focus mode (charts only)". The page title and the picker
+# rows are tucked into a collapsed "⚙ Chart settings" box above each chart; what stays visible is one slim row per chart —
+# a "Type any NSE symbol" box (type, press Enter) and a 🔄 button — and the charts are drawn taller (FOCUS_HEIGHT) and moved
+# to the top of the page. Nothing is lost: symbols, timeframes, refresh and saved indicator settings stay as they were.
+# Press F11 (browser full screen) and collapse the sidebar (« at its top) to see just the charts.
+FOCUS_HEIGHT = 800                    # chart height (px) in Focus mode
 CHART_LAYOUTS = ["2 side by side", "2 stacked", "1 chart (as before)"]
 DEFAULT_CHART_LAYOUT = "2 side by side"
 TELEGRAM_DEFAULT_ON = False          # V7: Telegram master switch starts OFF (set True to restore the old behaviour)
@@ -2583,11 +2589,13 @@ def draw_live_chart(kite_inst, symbol, instrument_token, prev_close, avg_vol, tf
 
 def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active,
                               groups=None, prev_close_lookup=None, avg_vol_lookup=None,
-                              slot=1, compact=False, tag="", default_h=700, default_refresh_on=15, show_header=True):
+                              slot=1, compact=False, tag="", default_h=700, default_refresh_on=15, show_header=True,
+                              focus=False):
     # V8: slot = chart number (1 or 2), compact = narrow picker rows for the two-chart layouts, tag = layout tag used in
     # the keys of timeframe / height / auto-refresh (so each layout remembers its own), default_h / default_refresh_on =
     # starting height and auto-refresh seconds while the market is open.
     import re as _re
+    import contextlib
 
     if show_header:
         st.divider()
@@ -2617,40 +2625,55 @@ def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is
         _fmt = lambda x: "Off" if x == 0 else f"{x} s"
         _sym_idx = 0 if slot == 1 else 1          # chart 2 starts on the 2nd symbol of its list
 
-        if compact:
-            c1a, c1b = st.columns(2)
-            src = c1a.selectbox("Page / list", list(groups), key=f"{kp}_src")
-            picked = c1b.selectbox("Symbol", groups[src], index=min(_sym_idx, len(groups[src]) - 1),
-                                   key=f"{kp}_sym_{src}")
-            c2a, c2b, c2c = st.columns([3, 2, 2])
-            typed = c2a.text_input("Or type any NSE symbol", key=f"{kp}_typed",
-                                   help="Leave empty to use the symbol picked above.").strip().upper()
-            tf_label = c2b.selectbox("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, key=f"{kp}_tf{tag}")
-            refresh_secs = c2c.selectbox(
-                "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
-                index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
-                format_func=_fmt, key=k_refresh, help=_tf_help)
-            c3a, c3b = st.columns([3, 2])
-            height = c3a.slider("Height", 450, 1000, default_h, 50, key=f"{kp}_h{tag}")
-            c3b.write("")
-            c3b.button("🔄 Refresh chart now", key=f"{kp}_refresh_now{tag}", use_container_width=True)
-        else:
-            r1a, r1b, r1c = st.columns([2, 3, 2])
-            src = r1a.selectbox("Page / list", list(groups), key=f"{kp}_src")
-            picked = r1b.selectbox("Symbol", groups[src], index=min(_sym_idx, len(groups[src]) - 1),
-                                   key=f"{kp}_sym_{src}")
-            typed = r1c.text_input("Or type any NSE symbol", key=f"{kp}_typed",
-                                   help="Leave empty to use the symbol picked on the left.").strip().upper()
-            r2a, r2b, r2c, r2d = st.columns([4, 2, 2, 2])
-            tf_label = r2a.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True,
-                                 key=f"{kp}_tf{tag}")
-            height = r2b.slider("Height", 450, 1000, default_h, 50, key=f"{kp}_h{tag}")
-            refresh_secs = r2c.selectbox(
-                "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
-                index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
-                format_func=_fmt, key=k_refresh, help=_tf_help)
-            r2d.write("")
-            r2d.button("🔄 Refresh chart now", key=f"{kp}_refresh_now{tag}", use_container_width=True)
+        # V9: Focus mode = slim "type any NSE symbol" row; every other picker sits in a collapsed settings box.
+        typed = ""
+        if focus:
+            fa, fb = st.columns([5, 1])
+            typed = fa.text_input("Type any NSE symbol", key=f"{kp}_typed", label_visibility="collapsed",
+                                  placeholder=f"Chart {slot}: type any NSE symbol (e.g. RELIANCE) and press Enter"
+                                  ).strip().upper()
+            fb.button("🔄", key=f"{kp}_refresh_focus{tag}", use_container_width=True, help="Refresh this chart now")
+        _holder = st.expander("⚙ Chart settings (page / symbol list, timeframe, height, auto-refresh)", expanded=False) \
+            if focus else contextlib.nullcontext()
+        with _holder:
+            if compact:
+                c1a, c1b = st.columns(2)
+                src = c1a.selectbox("Page / list", list(groups), key=f"{kp}_src")
+                picked = c1b.selectbox("Symbol", groups[src], index=min(_sym_idx, len(groups[src]) - 1),
+                                       key=f"{kp}_sym_{src}")
+                c2a, c2b, c2c = st.columns([3, 2, 2])
+                if not focus:
+                    typed = c2a.text_input("Or type any NSE symbol", key=f"{kp}_typed",
+                                           help="Leave empty to use the symbol picked above.").strip().upper()
+                tf_label = c2b.selectbox("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, key=f"{kp}_tf{tag}")
+                refresh_secs = c2c.selectbox(
+                    "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
+                    index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
+                    format_func=_fmt, key=k_refresh, help=_tf_help)
+                c3a, c3b = st.columns([3, 2])
+                height = c3a.slider("Height", 450, 1000, default_h, 50, key=f"{kp}_h{tag}")
+                c3b.write("")
+                c3b.button("🔄 Refresh chart now", key=f"{kp}_refresh_now{tag}", use_container_width=True)
+            else:
+                r1a, r1b, r1c = st.columns([2, 3, 2])
+                src = r1a.selectbox("Page / list", list(groups), key=f"{kp}_src")
+                picked = r1b.selectbox("Symbol", groups[src], index=min(_sym_idx, len(groups[src]) - 1),
+                                       key=f"{kp}_sym_{src}")
+                if not focus:
+                    typed = r1c.text_input("Or type any NSE symbol", key=f"{kp}_typed",
+                                           help="Leave empty to use the symbol picked on the left.").strip().upper()
+                r2a, r2b, r2c, r2d = st.columns([4, 2, 2, 2])
+                tf_label = r2a.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True,
+                                     key=f"{kp}_tf{tag}")
+                height = r2b.slider("Height", 450, 1000, default_h, 50, key=f"{kp}_h{tag}")
+                refresh_secs = r2c.selectbox(
+                    "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
+                    index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
+                    format_func=_fmt, key=k_refresh, help=_tf_help)
+                r2d.write("")
+                r2d.button("🔄 Refresh chart now", key=f"{kp}_refresh_now{tag}", use_container_width=True)
+        if focus:
+            height = FOCUS_HEIGHT
         symbol = typed if (typed and _re.fullmatch(r"[A-Z0-9&_.\- ]{1,30}", typed)) else picked
 
         if hasattr(st, "fragment") and refresh_secs != applied_refresh:
@@ -2687,12 +2710,17 @@ def render_live_charts(kite_inst, symbol_options, token_lookup, market_is_active
                       groups=None, prev_close_lookup=None, avg_vol_lookup=None):
     """V8: View Live Chart as one chart, two side by side, or two stacked (sidebar 'Live chart layout')."""
     layout = st.session_state.get("chart_layout", DEFAULT_CHART_LAYOUT)
-    common = dict(groups=groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup)
+    focus = bool(st.session_state.get("focus_mode", False))
+    common = dict(groups=groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup, focus=focus)
+    if focus:      # V9: tighter top padding so the charts start right under the top of the page
+        st.markdown("<style>.block-container{padding-top:1.2rem !important;}</style>", unsafe_allow_html=True)
     if layout == "1 chart (as before)":
-        render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active, **common)
+        render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active,
+                                  show_header=not focus, **common)
         return
-    st.divider()
-    st.header("📈 View Live Chart")
+    if not focus:
+        st.divider()
+        st.header("📈 View Live Chart")
     side = layout == "2 side by side"
     tag = "_sbs" if side else "_stk"
     kw = dict(compact=side, tag=tag, default_h=750 if side else 650,
@@ -2737,6 +2765,12 @@ with st.sidebar:
         key="chart_position",
         help="'Top of page' puts View Live Chart above the tables, so it stays in view and does not move when the "
              "tables below it change size."
+    )
+    st.toggle(
+        "🎯 Focus mode (charts only)", value=False, key="focus_mode",
+        help="Moves View Live Chart to the top, hides the title and the picker rows (they stay in a collapsed "
+             "'Chart settings' box), keeps one 'Type any NSE symbol' box per chart and draws the charts taller. "
+             "Use with F11 (browser full screen) and a collapsed sidebar."
     )
     st.radio(
         "Live chart layout", CHART_LAYOUTS, index=CHART_LAYOUTS.index(DEFAULT_CHART_LAYOUT), key="chart_layout",
@@ -3585,7 +3619,8 @@ if 'access_token' in st.session_state:
             "📅 Today's Triggered": _uniq([e.get("Symbol", "") for e in _today_entries]),
         }
 
-        if st.session_state.get("chart_position", DEFAULT_CHART_POSITION) == "Top of page":
+        if st.session_state.get("chart_position", DEFAULT_CHART_POSITION) == "Top of page" \
+                or st.session_state.get("focus_mode", False):
             with chart_slot:
                 render_live_charts(
                     st.session_state.kite, chart_symbols, token_lookup, market_active,
