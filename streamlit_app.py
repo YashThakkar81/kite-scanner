@@ -50,6 +50,21 @@ IST = pytz.timezone('Asia/Kolkata')
 #       - Chart position: bottom of the page (as before) or TOP of the page.
 #     Defaults for these are the constants right below (DEFAULT_SCREEN_MODE, DEFAULT_CHART_POSITION).
 # ================================================================
+# ================================================================
+# V8 — TWO LIVE CHARTS ON ONE PAGE (everything else is exactly as V7)
+# ================================================================
+#  "📈 View Live Chart" can now show TWO charts at the same time: side by side (default), stacked, or the single chart
+#  as before — sidebar -> "🖥 Screen & Chart Stability" -> "Live chart layout".
+#   - Each chart has its OWN picker row (page / symbol / typed symbol / timeframe / height / auto-refresh / refresh button)
+#     and its OWN fragment + timer: changing the symbol or timeframe of one chart never reruns or changes the other,
+#     and neither of them reruns the scanner.
+#   - Each chart keeps its OWN indicator settings, 💾 Save and candle layout in the browser (chart 1 keeps the settings
+#     you already saved; chart 2 starts fresh and saves separately).
+#   - In the two-chart layouts the auto-refresh defaults to 30 s per chart (each chart makes its own Kite calls).
+#   - The scanner, alerts, Telegram (off by default) and all tables are untouched. Defaults: DEFAULT_CHART_LAYOUT below.
+# ================================================================
+CHART_LAYOUTS = ["2 side by side", "2 stacked", "1 chart (as before)"]
+DEFAULT_CHART_LAYOUT = "2 side by side"
 TELEGRAM_DEFAULT_ON = False          # V7: Telegram master switch starts OFF (set True to restore the old behaviour)
 SCREEN_MODES = {                      # dashboard auto-refresh choices -> milliseconds (0 = paused)
     "Every 60 s (as before)": 60000,
@@ -1254,11 +1269,15 @@ LIVE_CHART_HTML = r"""<!DOCTYPE html>
   }
 
   // ---- browser storage (session = auto-kept while you work, local = 💾 Save) ----
+  // V8: chart 2 (DATA.slot = '_c2') keeps its own saved settings / layout; chart 1 (slot '') uses the original keys.
+  var SLOT = DATA.slot || '';
   function stGet(kind, key) {
+    key = key + SLOT;
     try { return (kind === 's' ? window.sessionStorage : window.localStorage).getItem(key); }
     catch (e) { return memStore[kind + key] || null; }
   }
   function stSet(kind, key, val) {
+    key = key + SLOT;
     try { (kind === 's' ? window.sessionStorage : window.localStorage).setItem(key, val); }
     catch (e) { memStore[kind + key] = val; }
   }
@@ -2512,7 +2531,7 @@ def _chart_daily_vo(daily_rows, live_volume):
 
 
 def draw_live_chart(kite_inst, symbol, instrument_token, prev_close, avg_vol, tf_label, height,
-                    refresh_secs, market_is_active, stats_source="Kite live"):
+                    refresh_secs, market_is_active, stats_source="Kite live", slot=1):
     interval, days = LIVE_CHART_TIMEFRAMES[tf_label]
     hist = fetch_live_chart_candles(kite_inst, instrument_token, interval, days)
     if not hist:
@@ -2557,16 +2576,22 @@ def draw_live_chart(kite_inst, symbol, instrument_token, prev_close, avg_vol, tf
         "serverTime": datetime.now(IST).strftime("%H:%M:%S"),
         "marketOpen": bool(market_is_active),
         "refresh": int(refresh_secs or 0),
+        "slot": "" if slot == 1 else f"_c{slot}",      # V8: separate browser-storage keys for chart 2
     }
     components.html(build_live_chart_html(payload), height=height, scrolling=False)
 
 
 def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active,
-                              groups=None, prev_close_lookup=None, avg_vol_lookup=None):
+                              groups=None, prev_close_lookup=None, avg_vol_lookup=None,
+                              slot=1, compact=False, tag="", default_h=700, default_refresh_on=15, show_header=True):
+    # V8: slot = chart number (1 or 2), compact = narrow picker rows for the two-chart layouts, tag = layout tag used in
+    # the keys of timeframe / height / auto-refresh (so each layout remembers its own), default_h / default_refresh_on =
+    # starting height and auto-refresh seconds while the market is open.
     import re as _re
 
-    st.divider()
-    st.header("📈 View Live Chart")
+    if show_header:
+        st.divider()
+        st.header("📈 View Live Chart")
 
     groups = {k: v for k, v in (groups or {"All scanner symbols": symbol_options}).items() if v}
     if not groups:
@@ -2574,36 +2599,59 @@ def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is
         return
     prev_close_lookup = prev_close_lookup or {}
     avg_vol_lookup = avg_vol_lookup or {}
+    kp = "livechart" if slot == 1 else f"livechart{slot}"
+    k_refresh = f"{kp}_refresh{tag}"
 
     # V7: the WHOLE chart block (pickers + chart) is one fragment, so changing the symbol / timeframe / height /
     # refresh re-runs only this block (a few Kite calls) instead of the full scanner, and its own timer (run_every)
     # refreshes only the chart. run_every is fixed when the fragment is created, so when the Auto-refresh choice
     # changes, one full rerun applies it (applied_refresh below is the value the fragment was created with).
-    default_refresh = 15 if market_is_active else 0
-    applied_refresh = st.session_state.get("livechart_refresh", default_refresh)
+    default_refresh = default_refresh_on if market_is_active else 0
+    applied_refresh = st.session_state.get(k_refresh, default_refresh)
     if applied_refresh not in LIVE_CHART_REFRESH_OPTIONS:
         applied_refresh = default_refresh
 
     def _section():
-        r1a, r1b, r1c = st.columns([2, 3, 2])
-        src = r1a.selectbox("Page / list", list(groups), key="livechart_src")
-        picked = r1b.selectbox("Symbol", groups[src], key=f"livechart_sym_{src}")
-        typed = r1c.text_input("Or type any NSE symbol", key="livechart_typed",
-                               help="Leave empty to use the symbol picked on the left.").strip().upper()
-        symbol = typed if (typed and _re.fullmatch(r"[A-Z0-9&_.\- ]{1,30}", typed)) else picked
+        _tf_help = "Re-pulls the forming candle from Kite. Only this chart reruns, not the whole scanner. " \
+                   "Set it to Off while you are changing indicator settings, then use 🔄 Refresh chart now."
+        _fmt = lambda x: "Off" if x == 0 else f"{x} s"
+        _sym_idx = 0 if slot == 1 else 1          # chart 2 starts on the 2nd symbol of its list
 
-        r2a, r2b, r2c, r2d = st.columns([4, 2, 2, 2])
-        tf_label = r2a.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True, key="livechart_tf")
-        height = r2b.slider("Height", 450, 1000, 700, 50, key="livechart_h")
-        refresh_secs = r2c.selectbox(
-            "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
-            index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
-            format_func=lambda x: "Off" if x == 0 else f"{x} s", key="livechart_refresh",
-            help="Re-pulls the forming candle from Kite. Only the chart reruns, not the whole scanner. "
-                 "Set it to Off while you are changing indicator settings, then use 🔄 Refresh chart now."
-        )
-        r2d.write("")
-        r2d.button("🔄 Refresh chart now", key="livechart_refresh_now", use_container_width=True)
+        if compact:
+            c1a, c1b = st.columns(2)
+            src = c1a.selectbox("Page / list", list(groups), key=f"{kp}_src")
+            picked = c1b.selectbox("Symbol", groups[src], index=min(_sym_idx, len(groups[src]) - 1),
+                                   key=f"{kp}_sym_{src}")
+            c2a, c2b, c2c = st.columns([3, 2, 2])
+            typed = c2a.text_input("Or type any NSE symbol", key=f"{kp}_typed",
+                                   help="Leave empty to use the symbol picked above.").strip().upper()
+            tf_label = c2b.selectbox("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, key=f"{kp}_tf{tag}")
+            refresh_secs = c2c.selectbox(
+                "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
+                index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
+                format_func=_fmt, key=k_refresh, help=_tf_help)
+            c3a, c3b = st.columns([3, 2])
+            height = c3a.slider("Height", 450, 1000, default_h, 50, key=f"{kp}_h{tag}")
+            c3b.write("")
+            c3b.button("🔄 Refresh chart now", key=f"{kp}_refresh_now{tag}", use_container_width=True)
+        else:
+            r1a, r1b, r1c = st.columns([2, 3, 2])
+            src = r1a.selectbox("Page / list", list(groups), key=f"{kp}_src")
+            picked = r1b.selectbox("Symbol", groups[src], index=min(_sym_idx, len(groups[src]) - 1),
+                                   key=f"{kp}_sym_{src}")
+            typed = r1c.text_input("Or type any NSE symbol", key=f"{kp}_typed",
+                                   help="Leave empty to use the symbol picked on the left.").strip().upper()
+            r2a, r2b, r2c, r2d = st.columns([4, 2, 2, 2])
+            tf_label = r2a.radio("Timeframe", list(LIVE_CHART_TIMEFRAMES), index=2, horizontal=True,
+                                 key=f"{kp}_tf{tag}")
+            height = r2b.slider("Height", 450, 1000, default_h, 50, key=f"{kp}_h{tag}")
+            refresh_secs = r2c.selectbox(
+                "Auto-refresh", LIVE_CHART_REFRESH_OPTIONS,
+                index=LIVE_CHART_REFRESH_OPTIONS.index(default_refresh),
+                format_func=_fmt, key=k_refresh, help=_tf_help)
+            r2d.write("")
+            r2d.button("🔄 Refresh chart now", key=f"{kp}_refresh_now{tag}", use_container_width=True)
+        symbol = typed if (typed and _re.fullmatch(r"[A-Z0-9&_.\- ]{1,30}", typed)) else picked
 
         if hasattr(st, "fragment") and refresh_secs != applied_refresh:
             st.rerun()          # full rerun, so the new auto-refresh interval takes effect
@@ -2623,7 +2671,7 @@ def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is
         src_label = "Kite live" if symbol in avg_vol_lookup else "Kite live, no 20D avg for this symbol"
 
         draw_live_chart(kite_inst, symbol, token, prev_close, avg_vol, tf_label, height,
-                        refresh_secs, market_is_active, src_label)
+                        refresh_secs, market_is_active, src_label, slot=slot)
 
         st.caption("Indicator settings are stored in this browser: changes are kept while you work, "
                    "press 💾 Save inside the chart to keep them (and the candle size / Indicators panel) for good. "
@@ -2633,6 +2681,31 @@ def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is
         st.fragment(run_every=(applied_refresh or None))(_section)()
     else:
         _section()
+
+
+def render_live_charts(kite_inst, symbol_options, token_lookup, market_is_active,
+                      groups=None, prev_close_lookup=None, avg_vol_lookup=None):
+    """V8: View Live Chart as one chart, two side by side, or two stacked (sidebar 'Live chart layout')."""
+    layout = st.session_state.get("chart_layout", DEFAULT_CHART_LAYOUT)
+    common = dict(groups=groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup)
+    if layout == "1 chart (as before)":
+        render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active, **common)
+        return
+    st.divider()
+    st.header("📈 View Live Chart")
+    side = layout == "2 side by side"
+    tag = "_sbs" if side else "_stk"
+    kw = dict(compact=side, tag=tag, default_h=750 if side else 650,
+              default_refresh_on=30, show_header=False, **common)
+    if side:
+        left, right = st.columns(2)
+        with left:
+            render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active, slot=1, **kw)
+        with right:
+            render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active, slot=2, **kw)
+    else:
+        render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active, slot=1, **kw)
+        render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active, slot=2, **kw)
 
 
 # --- 6. SIDEBAR ---
@@ -2664,6 +2737,12 @@ with st.sidebar:
         key="chart_position",
         help="'Top of page' puts View Live Chart above the tables, so it stays in view and does not move when the "
              "tables below it change size."
+    )
+    st.radio(
+        "Live chart layout", CHART_LAYOUTS, index=CHART_LAYOUTS.index(DEFAULT_CHART_LAYOUT), key="chart_layout",
+        help="View Live Chart as two charts side by side, two stacked, or a single chart. Each chart has its own "
+             "symbol / timeframe / refresh pickers and its own saved indicator settings. Tip: collapse this sidebar "
+             "(« at its top) to give the two charts more width."
     )
     if st.session_state.get("screen_mode", DEFAULT_SCREEN_MODE) == "Paused (stable chart)":
         st.caption("Dashboard paused: tables are as of the last refresh. The chart updates itself.")
@@ -3508,12 +3587,12 @@ if 'access_token' in st.session_state:
 
         if st.session_state.get("chart_position", DEFAULT_CHART_POSITION) == "Top of page":
             with chart_slot:
-                render_live_chart_section(
+                render_live_charts(
                     st.session_state.kite, chart_symbols, token_lookup, market_active,
                     groups=chart_groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup
                 )
         else:
-            render_live_chart_section(
+            render_live_charts(
                 st.session_state.kite, chart_symbols, token_lookup, market_active,
                 groups=chart_groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup
             )
