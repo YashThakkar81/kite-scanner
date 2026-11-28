@@ -68,7 +68,11 @@ IST = pytz.timezone('Asia/Kolkata')
 # a "Type any NSE symbol" box (type, press Enter) and a 🔄 button — and the charts are drawn taller (FOCUS_HEIGHT) and moved
 # to the top of the page. Nothing is lost: symbols, timeframes, refresh and saved indicator settings stay as they were.
 # Press F11 (browser full screen) and collapse the sidebar (« at its top) to see just the charts.
-FOCUS_HEIGHT = 800                    # chart height (px) in Focus mode
+# V10: in Focus mode the screen is budgeted so the "Type any NSE symbol" row (top) AND the chart's bottom status / timer
+# line are both visible without scrolling: the settings box moved BELOW the chart, the caption is hidden, gaps are tighter,
+# and the chart height comes from the sidebar slider "Focus chart height" (start value below; lower it if the bottom line
+# is still cut off on your screen, raise it on a bigger screen / with browser zoom at 80-90%).
+FOCUS_HEIGHT = 580                    # starting chart height (px) in Focus mode
 CHART_LAYOUTS = ["2 side by side", "2 stacked", "1 chart (as before)"]
 DEFAULT_CHART_LAYOUT = "2 side by side"
 TELEGRAM_DEFAULT_ON = False          # V7: Telegram master switch starts OFF (set True to restore the old behaviour)
@@ -2633,8 +2637,11 @@ def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is
                                   placeholder=f"Chart {slot}: type any NSE symbol (e.g. RELIANCE) and press Enter"
                                   ).strip().upper()
             fb.button("🔄", key=f"{kp}_refresh_focus{tag}", use_container_width=True, help="Refresh this chart now")
-        _holder = st.expander("⚙ Chart settings (page / symbol list, timeframe, height, auto-refresh)", expanded=False) \
-            if focus else contextlib.nullcontext()
+        if focus:
+            _chart_area = st.container()      # V10: the chart sits right under the symbol row; settings box goes below it
+            _holder = st.expander("⚙ Chart settings (page / symbol list, timeframe, height, auto-refresh)", expanded=False)
+        else:
+            _chart_area, _holder = contextlib.nullcontext(), contextlib.nullcontext()
         with _holder:
             if compact:
                 c1a, c1b = st.columns(2)
@@ -2673,32 +2680,34 @@ def render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is
                 r2d.write("")
                 r2d.button("🔄 Refresh chart now", key=f"{kp}_refresh_now{tag}", use_container_width=True)
         if focus:
-            height = FOCUS_HEIGHT
+            height = int(st.session_state.get("focus_height", FOCUS_HEIGHT))
         symbol = typed if (typed and _re.fullmatch(r"[A-Z0-9&_.\- ]{1,30}", typed)) else picked
 
         if hasattr(st, "fragment") and refresh_secs != applied_refresh:
             st.rerun()          # full rerun, so the new auto-refresh interval takes effect
 
-        token = token_lookup.get(symbol)
-        prev_close = prev_close_lookup.get(symbol, 0.0)
-        if not token:
-            info = fetch_live_chart_symbol_info(st.session_state.access_token, API_KEY, symbol)
-            if info:
-                token = info["token"]
-                prev_close = prev_close or info["prevClose"]
-        if not token:
-            st.warning(f"Instrument token not found for {symbol}.")
-            return
+        with _chart_area:
+            token = token_lookup.get(symbol)
+            prev_close = prev_close_lookup.get(symbol, 0.0)
+            if not token:
+                info = fetch_live_chart_symbol_info(st.session_state.access_token, API_KEY, symbol)
+                if info:
+                    token = info["token"]
+                    prev_close = prev_close or info["prevClose"]
+            if not token:
+                st.warning(f"Instrument token not found for {symbol}.")
+                return
 
-        avg_vol = avg_vol_lookup.get(symbol, 0)
-        src_label = "Kite live" if symbol in avg_vol_lookup else "Kite live, no 20D avg for this symbol"
+            avg_vol = avg_vol_lookup.get(symbol, 0)
+            src_label = "Kite live" if symbol in avg_vol_lookup else "Kite live, no 20D avg for this symbol"
 
-        draw_live_chart(kite_inst, symbol, token, prev_close, avg_vol, tf_label, height,
-                        refresh_secs, market_is_active, src_label, slot=slot)
+            draw_live_chart(kite_inst, symbol, token, prev_close, avg_vol, tf_label, height,
+                            refresh_secs, market_is_active, src_label, slot=slot)
 
-        st.caption("Indicator settings are stored in this browser: changes are kept while you work, "
-                   "press 💾 Save inside the chart to keep them (and the candle size / Indicators panel) for good. "
-                   "Full screen: ⛶ button inside the chart.")
+            if not focus:
+                st.caption("Indicator settings are stored in this browser: changes are kept while you work, "
+                           "press 💾 Save inside the chart to keep them (and the candle size / Indicators panel) for good. "
+                           "Full screen: ⛶ button inside the chart.")
 
     if hasattr(st, "fragment"):
         st.fragment(run_every=(applied_refresh or None))(_section)()
@@ -2713,7 +2722,8 @@ def render_live_charts(kite_inst, symbol_options, token_lookup, market_is_active
     focus = bool(st.session_state.get("focus_mode", False))
     common = dict(groups=groups, prev_close_lookup=prev_close_lookup, avg_vol_lookup=avg_vol_lookup, focus=focus)
     if focus:      # V9: tighter top padding so the charts start right under the top of the page
-        st.markdown("<style>.block-container{padding-top:1.2rem !important;}</style>", unsafe_allow_html=True)
+        st.markdown("<style>.block-container{padding-top:3.2rem !important;} "
+                    "div[data-testid=\"stVerticalBlock\"]{gap:0.45rem !important;}</style>", unsafe_allow_html=True)
     if layout == "1 chart (as before)":
         render_live_chart_section(kite_inst, symbol_options, token_lookup, market_is_active,
                                   show_header=not focus, **common)
@@ -2772,6 +2782,10 @@ with st.sidebar:
              "'Chart settings' box), keeps one 'Type any NSE symbol' box per chart and draws the charts taller. "
              "Use with F11 (browser full screen) and a collapsed sidebar."
     )
+    if st.session_state.get("focus_mode", False):
+        st.slider("Focus chart height", 400, 1000, FOCUS_HEIGHT, 20, key="focus_height",
+                  help="Chart height in Focus mode. Lower it if the chart's bottom status / timer line is cut off, "
+                       "raise it on a bigger screen.")
     st.radio(
         "Live chart layout", CHART_LAYOUTS, index=CHART_LAYOUTS.index(DEFAULT_CHART_LAYOUT), key="chart_layout",
         help="View Live Chart as two charts side by side, two stacked, or a single chart. Each chart has its own "
